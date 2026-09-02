@@ -14,7 +14,7 @@ export class RecallService {
   constructor(private readonly llm: LlmClient) {}
 
   async answer(question: string, history: ChatTurn[], summary = ""): Promise<string> {
-    const recent = history.slice(-8);
+    const recent = history.slice(-14);
     if (recent.length === 0) {
       return "We just started, so we haven't covered anything yet. What would you like to learn?";
     }

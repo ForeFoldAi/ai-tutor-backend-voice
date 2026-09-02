@@ -107,6 +107,14 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
         await this.voice.interruptSession(sessionId);
         return;
       }
+      if (type === "token_update") {
+        const sessionId = String(msg.sessionId || client.sessionId || "");
+        const token = String(msg.token || "");
+        if (!sessionId || !token || !client.studentId) return;
+        const ok = await this.voice.updateAccessToken(sessionId, token, client.studentId);
+        if (!ok) this.send(client, "voice_error", { message: "Session expired. Start a new voice session." });
+        return;
+      }
       if (type === "text") {
         await this.voice.handleText(sessionId, String(msg.text || ""));
         return;
@@ -188,6 +196,11 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }
     const session = await this.memory.get(sessionId);
     if (!session || session.studentId !== user.studentId) {
+      this.send(client, "voice_error", { message: "Session expired. Start a new voice session." });
+      return;
+    }
+    const updated = await this.voice.updateAccessToken(sessionId, token, user.studentId);
+    if (!updated) {
       this.send(client, "voice_error", { message: "Session expired. Start a new voice session." });
       return;
     }

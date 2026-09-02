@@ -1,7 +1,7 @@
 import { Injectable } from "@nestjs/common";
-import { TutorAction, TutorSnapshot } from "./interfaces";
+import { TutorAction, AnswerGrade } from "./interfaces";
 import { followupIntent, isRecallQuestion } from "./query-rewriter";
-import { AnswerGrade } from "./interfaces";
+import { classifyReplyIntent } from "./reply-intent";
 
 /** Clear refusals / topic pivots while a check question is open. */
 const REFUSAL_OR_PIVOT =
@@ -18,28 +18,35 @@ export function looksLikeNewQuestion(utterance: string): boolean {
 export function decideAction(opts: {
   utterance: string;
   awaitingAnswer: boolean;
-  grade?: AnswerGrade;
   turnsSinceCheck: number;
   lastAssistant?: string;
 }): TutorAction {
-  const intent = followupIntent(opts.utterance);
-  if (intent === "simplify") return "SIMPLIFY";
-  if (intent === "example") return "PROVIDE_EXAMPLE";
-  if (intent === "quiz") return "START_QUIZ";
+  const intent = classifyReplyIntent(opts.utterance, opts.awaitingAnswer);
+
+  if (intent === "CLOSING") return "ANSWER";
+
+  const fi = followupIntent(opts.utterance);
+  if (fi === "simplify") return "SIMPLIFY";
+  if (fi === "example") return "PROVIDE_EXAMPLE";
+  if (fi === "quiz") return "START_QUIZ";
+
   if (opts.awaitingAnswer) {
-    // Don't grade a new question, recall, or clear refusal as the quiz answer.
-    if (looksLikeNewQuestion(opts.utterance) || REFUSAL_OR_PIVOT.test(opts.utterance.trim())) {
-      if (looksLikeNewQuestion(opts.utterance)) return "EXPLAIN";
-      return "ANSWER";
-    }
+    if (intent === "DONT_KNOW") return "SIMPLIFY";
+    if (looksLikeNewQuestion(opts.utterance)) return "EXPLAIN";
+    if (REFUSAL_OR_PIVOT.test(opts.utterance.trim())) return "ANSWER";
+    if (intent === "WRONG_ANSWER") return "EVALUATE";
+    if (intent === "UNCLEAR") return "REQUEST_CLARIFICATION";
     return "EVALUATE";
   }
+
+  if (intent === "DONT_KNOW") return "SIMPLIFY";
+
   if (looksLikeNewQuestion(opts.utterance)) return "EXPLAIN";
   return "ANSWER";
 }
 
 export function afterExplainShouldCheck(
-  snap: TutorSnapshot,
+  snap: { awaitingAnswer: boolean; turnsSinceCheck: number },
   assistantText: string,
   action?: TutorAction,
 ): boolean {

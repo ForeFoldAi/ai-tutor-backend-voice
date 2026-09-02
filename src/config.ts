@@ -43,6 +43,9 @@ export const config = {
   jwtSecret: env("JWT_SECRET_KEY", "change-me-in-production"),
   jwtAlg: env("JWT_ALGORITHM", "HS256"),
   redisUrl: env("REDIS_URL", "redis://localhost:6379/0"),
+  redisConnectTimeoutMs: envInt("REDIS_CONNECT_TIMEOUT_MS", 5000),
+  /** Remote Redis often needs >2s; local dev can lower this. */
+  redisCommandTimeoutMs: envInt("REDIS_COMMAND_TIMEOUT_MS", 8000),
   databaseUrl: env("DATABASE_URL"),
   tutorApiUrl: env("TUTOR_API_URL", "http://127.0.0.1:8000").replace(/\/$/, ""),
   llmBaseUrl: env("LLM_BASE_URL", "https://api.mistral.ai/v1").replace(/\/$/, ""),
@@ -53,6 +56,12 @@ export const config = {
   turnUsername: env("TURN_USERNAME"),
   turnCredential: env("TURN_CREDENTIAL"),
   whisperModel: env("WHISPER_MODEL", "Xenova/whisper-tiny.en"),
+  /** Min captured speech before STT — shorter clips are usually VAD false stops. */
+  sttMinUtteranceMs: envInt("STT_MIN_UTTERANCE_MS", 350),
+  /** Min RMS on captured PCM — rejects silence/noise Whisper labels as (laughing). */
+  sttMinSpeechRms: Number(env("STT_MIN_SPEECH_RMS", "0.008")) || 0.008,
+  /** Ignore mic after tutor audio ends — speaker echo otherwise becomes a fake turn. */
+  sttPostPlaybackMs: envInt("STT_POST_PLAYBACK_MS", 1000),
   /** kokoro (local, en-US/en-GB) | edge (Microsoft, has en-IN voices) */
   ttsProvider: env("TTS_PROVIDER", "kokoro").toLowerCase(),
   kokoroVoice: env("KOKORO_VOICE", "af_heart"),
@@ -60,6 +69,10 @@ export const config = {
   edgeTtsVoice: env("EDGE_TTS_VOICE", "en-IN-NeerjaNeural"),
   edgeTtsRate: env("EDGE_TTS_RATE", "+0%"),
   edgeTtsTimeoutMs: envInt("EDGE_TTS_TIMEOUT_MS", 15000),
+  /** Shared secret with FastAPI VOICE_INTERNAL_TOKEN — Edge TTS without student JWT. */
+  voiceInternalToken: env("VOICE_INTERNAL_TOKEN"),
+  /** When false and TTS_PROVIDER=edge, do not fall back to Kokoro on Edge errors. */
+  ttsEdgeFallback: envBool("TTS_EDGE_FALLBACK", true),
   /** Short cached "let me think" audio played while a slow turn is still working. */
   thinkingFiller: envBool("VOICE_THINKING_FILLER", true),
   fillerDelayMs: envInt("VOICE_FILLER_DELAY_MS", 700),
@@ -70,6 +83,8 @@ export const config = {
   fillerAdaptive: envBool("VOICE_FILLER_ADAPTIVE", true),
   /** Fraction of students who hear fillers, for measuring the effect. 1 = everyone. */
   fillerSampleRate: envRate("VOICE_FILLER_SAMPLE_RATE", 1),
+  /** When true, LLM asks check-ins naturally instead of scripted quiz append. */
+  naturalCheckins: envBool("VOICE_NATURAL_CHECKINS", false),
   /** Speak each sentence as the LLM writes it instead of waiting for the full answer. */
   streamTts: envBool("VOICE_STREAM_TTS", true),
   streamFirstChunkChars: envInt("VOICE_STREAM_FIRST_CHUNK_CHARS", 40),

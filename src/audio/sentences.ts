@@ -16,6 +16,38 @@ export const CHUNK_MIN_CHARS = 80;
 /** Force a break in run-on text so an unpunctuated list can't stall the stream. */
 export const CHUNK_MAX_CHARS = 320;
 
+/**
+ * Strip anything Edge TTS would read out literally.
+ *
+ * The system prompt forbids markdown, LaTeX and figure numbers, but a prompt
+ * is not an enforcement mechanism — a single stray `**` makes the tutor say
+ * "asterisk asterisk" to a child. Runs on whole chunks, never on raw tokens,
+ * so multi-token markup is already complete by the time it gets here.
+ */
+export function speakable(text: string): string {
+  return (
+    text
+      .replace(/```[\s\S]*?```/g, " ")
+      .replace(/`([^`]*)`/g, "$1")
+      .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+      .replace(/\$\$?([^$]*?)\$\$?/g, "$1")
+      .replace(/\\[a-zA-Z]+\s?/g, " ")
+      .replace(/\^2\b/g, " squared")
+      .replace(/\^3\b/g, " cubed")
+      .replace(/\^(-?\d+)/g, " to the power $1")
+      .replace(/_\{?(\d+)\}?/g, " sub $1")
+      .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+      .replace(/^\s*(?:[-*+•]|\d+[.)])\s+/gm, "")
+      .replace(/\(\s*(?:see\s+)?(?:Fig|Figure|Table|Page|p)\.?\s*[\d.]+\s*\)/gi, " ")
+      // Left over after the structural passes above: emphasis, blockquote and
+      // table markers that only ever appear as markup, never as speech.
+      .replace(/[*_~>|#{}\\]/g, "")
+      .replace(/\s+([,.;:!?])/g, "$1")
+      .replace(/\s+/g, " ")
+      .trim()
+  );
+}
+
 export class SentenceStream {
   private buf = "";
   private emitted = 0;

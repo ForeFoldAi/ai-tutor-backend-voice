@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { SentenceStream } from "./sentences";
+import { SentenceStream, speakable } from "./sentences";
 
 /** Feed one character at a time — the worst case an LLM token stream can produce. */
 function drip(text: string, s: SentenceStream): string[] {
@@ -63,5 +63,50 @@ describe("streaming sentence split", () => {
     assert.equal(s.flush(), "");
     assert.equal(s.flush(), "");
     assert.equal(s.chunkCount, 0);
+  });
+});
+
+describe("speakable", () => {
+  const NOT_SPEECH = /[*_~`$#|\\{}]|\bFig\b/;
+
+  it("leaves ordinary spoken text untouched", () => {
+    const plain = "The Hoysalas ruled from Dwarasamudra, isn't it? Let's look at why.";
+    assert.equal(speakable(plain), plain);
+  });
+
+  it("keeps hyphens and apostrophes that belong to the words", () => {
+    assert.equal(speakable("It's a well-known trade route."), "It's a well-known trade route.");
+  });
+
+  it("strips every markup form Edge TTS would read out loud", () => {
+    const cases = [
+      "**Bold** and *italic* and _under_ text",
+      "# A heading\n- first point\n- second point",
+      "Use `code` and ```a block``` here",
+      "See [the map](https://example.com/map.png) now",
+      "| col | col |",
+      "> quoted line",
+    ];
+    for (const c of cases) {
+      const out = speakable(c);
+      assert.ok(!NOT_SPEECH.test(out), `markup survived: ${JSON.stringify(out)}`);
+      assert.ok(out.length > 0, `everything was stripped: ${JSON.stringify(c)}`);
+    }
+  });
+
+  it("says math aloud instead of spelling out symbols", () => {
+    assert.equal(speakable("Area is $x^2$ units."), "Area is x squared units.");
+    assert.equal(speakable("Volume is $r^3$."), "Volume is r cubed.");
+    assert.ok(!NOT_SPEECH.test(speakable("\\frac{a}{b} is a fraction")));
+  });
+
+  it("drops figure and page pointers that are not meant to be spoken", () => {
+    assert.equal(speakable("Look at the map (Fig. 2.3) again."), "Look at the map again.");
+    assert.equal(speakable("It is shown there (see Figure 4.1)."), "It is shown there.");
+  });
+
+  it("returns empty for markup with no words, so the chunk is skipped", () => {
+    assert.equal(speakable("***"), "");
+    assert.equal(speakable("   "), "");
   });
 });

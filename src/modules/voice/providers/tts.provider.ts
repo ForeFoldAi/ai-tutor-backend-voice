@@ -32,6 +32,7 @@ export class TtsProvider implements ITTSProvider {
     try {
       return await this.edge.synthesize(text, accessToken);
     } catch (err) {
+      if (!config.ttsEdgeFallback) throw err;
       this.log.warn(`edge tts failed, falling back to kokoro (${config.kokoroVoice}): ${err}`);
       return this.kokoro.synthesize(text);
     }

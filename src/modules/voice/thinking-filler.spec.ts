@@ -8,6 +8,7 @@ import {
   FillerIntent,
   inFillerCohort,
   median,
+  pickPhraseForTurn,
   pickPhraseIndex,
   shouldArmFiller,
 } from "./thinking-filler.service";
@@ -17,6 +18,7 @@ const INTENTS = Object.keys(FILLER_PHRASES) as FillerIntent[];
 describe("filler rotation", () => {
   it("never repeats the same phrase twice in a row", () => {
     for (const intent of INTENTS) {
+      if (intent === "closing") continue;
       let last = -1;
       for (let turn = 0; turn < 24; turn++) {
         const next = pickPhraseIndex(FILLER_PHRASES[intent].length, last);
@@ -37,9 +39,23 @@ describe("filler rotation", () => {
   });
 });
 
+describe("utterance-seeded phrase pick", () => {
+  it("varies by student prompt", () => {
+    const a = pickPhraseForTurn(3, -1, "What is weather?");
+    const b = pickPhraseForTurn(3, -1, "Tell me about mughals");
+    assert.notEqual(a, b);
+  });
+
+  it("never repeats back to back within the same intent", () => {
+    const next = pickPhraseForTurn(3, 1, "What is weather?");
+    assert.notEqual(next, 1);
+  });
+});
+
 describe("filler phrase library", () => {
-  it("covers every intent with at least two phrases", () => {
+  it("covers every intent with at least two phrases (except closing)", () => {
     for (const intent of INTENTS) {
+      if (intent === "closing") continue;
       assert.ok(FILLER_PHRASES[intent].length >= 2, `${intent} cannot rotate`);
     }
     assert.ok(INTENTS.includes("general"), "general is the fallback and must exist");

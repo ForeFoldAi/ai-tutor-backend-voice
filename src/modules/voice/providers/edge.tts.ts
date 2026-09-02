@@ -28,12 +28,18 @@ export class EdgeTtsProvider implements ITTSProvider {
     const spoken = text.replace(/[*#_]/g, " ").replace(/\s+/g, " ").trim();
     if (!spoken) return { pcm: new Float32Array(0), sampleRate: 16000 };
 
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (config.voiceInternalToken) {
+      headers["X-Voice-Token"] = config.voiceInternalToken;
+    } else if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    } else {
+      throw new Error("edge tts needs VOICE_INTERNAL_TOKEN or a student access token");
+    }
+
     const res = await fetch(`${config.tutorApiUrl}/auth/voice-tts-pcm`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
+      headers,
       body: JSON.stringify({ text: spoken, voice: config.edgeTtsVoice }),
       signal: AbortSignal.timeout(config.edgeTtsTimeoutMs),
     });

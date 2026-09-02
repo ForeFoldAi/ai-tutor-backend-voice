@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { rewriteRetrievalQuery, followupIntent, topicFromQuestion } from "./query-rewriter";
 import { gradeByOverlap } from "./answer-evaluator.service";
 import { nextDifficulty } from "./difficulty-manager.service";
+import { classifyReplyIntent } from "./reply-intent";
 import { afterEvaluate, afterExplainShouldCheck, decideAction, looksLikeNewQuestion } from "./tutor-orchestrator.service";
 import { defaultSnapshot } from "./tutor-state.service";
 import { turnStillActive } from "./turn-commit";
@@ -26,6 +27,22 @@ describe("query rewrite", () => {
     assert.equal(followupIntent("Can you explain that more simply?"), "simplify");
     assert.equal(followupIntent("Give me an example."), "example");
     assert.equal(followupIntent("Ask me a question."), "quiz");
+  });
+
+  it("rewrites who-started-it against the prior topic", () => {
+    const q = rewriteRetrievalQuery("Who started it?", [
+      { role: "user", content: "Tell me about the Delhi Sultanate." },
+      { role: "assistant", content: "It was a series of dynasties." },
+    ]);
+    assert.match(q.toLowerCase(), /delhi sultanate/);
+  });
+
+  it("resolves it in did-it-control follow-up", () => {
+    const q = rewriteRetrievalQuery("Did it control all of India?", [
+      { role: "user", content: "What was the Delhi Sultanate?" },
+      { role: "assistant", content: "It was a series of dynasties in north India." },
+    ]);
+    assert.match(q.toLowerCase(), /delhi sultanate/);
   });
 
   it("does not treat a clear topic change as deixis rewrite", () => {
@@ -104,6 +121,29 @@ describe("orchestrator", () => {
         turnsSinceCheck: 1,
       }),
       "EXPLAIN",
+    );
+  });
+  it("does not evaluate I don't know while awaiting", () => {
+    assert.equal(
+      decideAction({ utterance: "I don't know.", awaitingAnswer: true, turnsSinceCheck: 1 }),
+      "SIMPLIFY",
+    );
+    assert.equal(classifyReplyIntent("I don't know.", true), "DONT_KNOW");
+  });
+  it("does not evaluate confusion while awaiting", () => {
+    assert.equal(
+      decideAction({
+        utterance: "I didn't get what you're saying.",
+        awaitingAnswer: true,
+        turnsSinceCheck: 1,
+      }),
+      "SIMPLIFY",
+    );
+  });
+  it("treats goodbye as answer not evaluate", () => {
+    assert.equal(
+      decideAction({ utterance: "Bye bye.", awaitingAnswer: true, turnsSinceCheck: 3 }),
+      "ANSWER",
     );
   });
   it("does not evaluate a clear refusal while awaiting", () => {

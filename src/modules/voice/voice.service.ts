@@ -4,17 +4,20 @@ import { MSG } from "../../common/messages";
 import { voiceLog } from "../../common/logger";
 import { floatToInt16, int16ToFloat, packPcm, PCM_SAMPLE_RATE, resample, unpackPcm } from "../../audio/pcm";
 import { SileroVad, loadSilero } from "../../audio/vad";
+import { speakable } from "../../audio/sentences";
 import { ConversationMemoryService, VoiceSession } from "../conversation/conversation-memory.service";
 import { SessionOwnershipService } from "../conversation/session-ownership.service";
 import { ConversationSummaryService } from "../conversation/conversation-summary.service";
 import { ProgressService } from "../progress/progress.service";
-import { RagClient } from "../rag/rag.client";
+import { RagClient, RagAuthError, RagResult } from "../rag/rag.client";
 import { AnswerEvaluatorService } from "../tutor/answer-evaluator.service";
 import { nextDifficulty } from "../tutor/difficulty-manager.service";
 import { QueryRewriterService } from "../tutor/query-rewriter.service";
 import { QuestionGeneratorService } from "../tutor/question-generator.service";
 import { afterEvaluate, afterExplainShouldCheck, decideAction } from "../tutor/tutor-orchestrator.service";
+import { classifyReplyIntent, isBareAcknowledgement, ackReply } from "../tutor/reply-intent";
 import { followupIntent, isRecallQuestion, topicFromQuestion } from "../tutor/query-rewriter";
+import { NestFollowupIntent } from "../tutor/interfaces";
 import { RecallService } from "../tutor/recall.service";
 import { AnswerGrade, ChatTurn, SessionScope } from "../tutor/interfaces";
 import { turnStillActive } from "../tutor/turn-commit";
@@ -24,9 +27,11 @@ import {
   userTranscriptCommitted,
   userTranscriptPending,
 } from "./transcript-events";
+import { isLikelyEcho, isMeaningfulTranscript, pcmSpeechRms, postprocessTranscript } from "./stt-quality";
 import { WhisperSttProvider } from "./providers/whisper.stt";
 import { TtsProvider } from "./providers/tts.provider";
 import { FillerIntent, ThinkingFillerService } from "./thinking-filler.service";
+import { fillerIntentForTurn } from "./quick-affect";
 import { WebrtcService } from "./webrtc.service";
 import { IVoiceProvider, VoiceSessionHandle } from "./interfaces/voice-provider";
 import { randomUUID } from "crypto";
@@ -60,8 +65,12 @@ type Live = {
   ttfa: number[];
   /** This student's A/B assignment, fixed for the session. */
   fillerCohort: boolean;
+  /** Phrase spoken as thinking filler this turn (for LLM de-duplication). */
+  lastFillerPhrase: string;
   /** Queue one turn at a time per session (pcmQ already serializes VAD; this covers text + STT). */
   turnQ: Promise<void>;
+  /** Epoch ms the tutor last finished speaking (echo window). */
+  lastSpokeAt: number;
 };
 
 /**
@@ -85,7 +94,16 @@ type SpeechStream = {
 };
 
 const TTFA_SAMPLES = 8;
-const NOT_IN_CHAPTER = /couldn't find this in your chapter/i;
+/**
+ * A refusal the student should hear as MSG.notInTextbook instead.
+ *
+ * Covers both the canned FastAPI string and the wording the voice system
+ * prompt itself prescribes when the retrieved context is too thin — the
+ * model authors that sentence, so matching only the canned one silently
+ * misses every model-authored refusal.
+ */
+const NOT_IN_CHAPTER =
+  /couldn't find this in your chapter|don'?t see that (?:detail|information) in the textbook|don'?t have enough information about that/i;
 
 @Injectable()
 export class VoiceService implements IVoiceProvider, OnModuleInit {
@@ -159,6 +177,16 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     return session;
   }
 
+  /** Keep FastAPI bearer fresh after resume / token refresh from the client. */
+  async updateAccessToken(sessionId: string, token: string, studentId: string): Promise<boolean> {
+    const session = await this.memory.get(sessionId);
+    if (!session || session.studentId !== studentId) return false;
+    session.accessToken = token;
+    await this.memory.save(session);
+    this.filler.warm(token);
+    return true;
+  }
+
   async attachTransport(
     sessionId: string,
     emit: Emit,
@@ -183,7 +211,9 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       ttfaMs: 0,
       ttfa: [],
       fillerCohort: true,
+      lastFillerPhrase: "",
       turnQ: Promise.resolve(),
+      lastSpokeAt: 0,
     };
     this.live.set(sessionId, live);
     void this.memory.get(sessionId).then((s) => {
@@ -247,7 +277,10 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       live.emit("student_started_speaking");
       // Filler audio is interruptible AI audio like any other — it does not set
       // `speaking`, so barge-in has to check it explicitly.
-      if (live.speaking || this.fillerAudible(live)) void this.interruptSession(live.sessionId);
+      if (live.speaking || this.fillerAudible(live)) {
+        if (pcmSpeechRms(samples) < config.sttMinSpeechRms) return;
+        void this.interruptSession(live.sessionId);
+      }
     } else if (live.chunks.length > 0 || events.includes("speech")) {
       live.chunks.push(samples);
     }
@@ -255,6 +288,10 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       live.emit("student_stopped_speaking");
       const merged = concat(live.chunks);
       live.chunks = [];
+      if (Date.now() - live.lastSpokeAt < config.sttPostPlaybackMs) {
+        live.vad.reset();
+        return;
+      }
       void this.enqueueTurn(live.sessionId, () => this.handleUtterance(live.sessionId, merged));
     }
   }
@@ -297,6 +334,11 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     }
     live?.emit("ai_interrupted");
     live?.emit("student_started_speaking");
+    if (live) {
+      live.chunks = [];
+      live.vad.reset();
+      live.lastSpokeAt = Date.now();
+    }
   }
 
   async end(sessionId: string): Promise<void> {
@@ -324,6 +366,15 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     if (!session) return;
     session.state = "PROCESSING";
     await this.memory.save(session);
+
+    const minSamples = Math.floor((PCM_SAMPLE_RATE * config.sttMinUtteranceMs) / 1000);
+    if (pcm.length < minSamples || pcmSpeechRms(pcm) < config.sttMinSpeechRms) {
+      session.state = "LISTENING";
+      await this.memory.save(session);
+      live?.emit("ai_stopped_processing");
+      return;
+    }
+
     let text = "";
     try {
       const f32 = int16ToFloat(pcm);
@@ -334,8 +385,14 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       return;
     }
     voiceLog("stt", { sessionId, studentId: session.studentId, sttMs: Date.now() - t0 });
-    if (!text) {
-      await this.speak(sessionId, MSG.emptySpeech);
+    text = postprocessTranscript(text, session.scope.subject);
+    const lastAssistant = [...(session.recentMessages || [])]
+      .reverse()
+      .find((t) => t.role === "assistant")?.content || "";
+    if (!text || !isMeaningfulTranscript(text) || isLikelyEcho(text, lastAssistant)) {
+      session.state = "LISTENING";
+      await this.memory.save(session);
+      live?.emit("ai_stopped_processing");
       return;
     }
     await this.runTurn(sessionId, text, t0);
@@ -356,12 +413,16 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
 
     const history = session.recentMessages;
     const chapterName = session.scope.chapterNames[0] || session.scope.chapter || "";
-    const intent = followupIntent(utterance);
+    const followup = followupIntent(utterance);
+    const replyIntent = classifyReplyIntent(utterance, session.tutor.awaitingAnswer);
+    if (replyIntent === "CLOSING") session.tutor.awaitingAnswer = false;
     let action = decideAction({
       utterance,
       awaitingAnswer: session.tutor.awaitingAnswer,
       turnsSinceCheck: session.tutor.turnsSinceCheck,
     });
+    let ragFollowup: NestFollowupIntent | string = followup;
+    if (action === "SIMPLIFY" || replyIntent === "DONT_KNOW") ragFollowup = "simplify";
 
     // Owned by this turn: interruptSession swaps in a fresh controller, so the
     // captured signal is the only way to tell "my work was cancelled" apart
@@ -377,7 +438,19 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       if (!opts.synthetic) {
         live.emit("transcript", userTranscriptPending(turnId, utterance));
       }
-      if (opts.filler !== false) this.armFiller(live, turnId, fillerIntentFor(action, intent));
+      if (opts.filler !== false) {
+        const { intent: fillerIntent, skip } = fillerIntentForTurn(
+          utterance,
+          action,
+          followup,
+          session.tutor.awaitingAnswer,
+        );
+        // Acks answer instantly from a canned line — a "let me think" filler
+        // would land on top of the reply it was supposed to cover.
+        if (!skip && !isBareAcknowledgement(utterance)) {
+          this.armFiller(live, turnId, fillerIntent, utterance);
+        }
+      }
     }
 
     const speech: SpeechStream = {
@@ -408,7 +481,14 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       // This wins even while awaiting an answer — "what was the question
       // again?" must not be graded as a wrong answer. awaitingAnswer is left
       // set, so the tutor still expects the real answer next turn.
-      if (recall) {
+      if (!recall && followup === "normal" && isBareAcknowledgement(utterance)) {
+        action = "ANSWER";
+        reply = ackReply(utterance);
+        // Reacting to a check question is not answering it. Skipping the
+        // grader is only half the fix — the latch has to stay set too, or
+        // the question is silently dropped and never asked again.
+        if (session.tutor.awaitingAnswer) reply = `${reply} ${MSG.questionStillOpen}`;
+      } else if (recall) {
         action = "RECALL";
         reply = await this.recall.answer(utterance, history, session.summary);
       } else if (action === "EVALUATE") {
@@ -434,7 +514,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
           difficulty: session.tutor.difficulty,
           consecutiveCorrect: session.tutor.consecutiveCorrect,
           consecutiveIncorrect: session.tutor.consecutiveIncorrect,
-          simplifyRequested: intent === "simplify",
+          simplifyRequested: followup === "simplify",
         });
         session.tutor.difficulty = next.difficulty;
         session.tutor.consecutiveCorrect = next.consecutiveCorrect;
@@ -462,11 +542,13 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
           // Canonical student message — never the retrieval rewrite.
           query: utterance,
           guardNotFound: false,
+          followup: ragFollowup,
         });
         ragMs = rag.ms;
         retrievedIds = rag.retrievedIds;
         pages = rag.pages;
         reply = `${prefix} ${rag.answer}`.trim();
+        if (rag.voiceMeta) this.applyVoiceMeta(session, rag.voiceMeta, live);
         if (grade === "CORRECT" && next.difficulty > session.tutor.difficulty - 1) {
           tail = "Now let's try something slightly harder.";
           reply += ` ${tail}`;
@@ -484,26 +566,42 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
           signal,
           query: utterance,
           guardNotFound: true,
+          followup: ragFollowup,
         });
         ragMs = rag.ms;
         retrievedIds = rag.retrievedIds;
         pages = rag.pages;
         reply = rag.answer;
+        if (rag.voiceMeta) this.applyVoiceMeta(session, rag.voiceMeta, live);
         if (!reply) reply = MSG.notInTextbook;
-        if (NOT_IN_CHAPTER.test(reply)) {
+        // Only swap in the canned refusal while nothing has been spoken yet.
+        // Once sentences are on the wire, rewriting `reply` would leave the
+        // transcript and the stored history saying something the student
+        // never heard — and history is what the next turn retrieves against.
+        if (speech.dispatched === 0 && NOT_IN_CHAPTER.test(reply)) {
           action = "OUT_OF_SCOPE";
           reply = MSG.notInTextbook;
         }
         session.tutor.currentConcept =
           topicFromQuestion(retrievalQuery) || session.tutor.currentConcept;
         session.currentTopic = session.tutor.currentConcept;
-        if (intent === "simplify") action = "SIMPLIFY";
-        if (intent === "example") action = "PROVIDE_EXAMPLE";
-        if (intent === "quiz") action = "START_QUIZ";
+        if (followup === "simplify") action = "SIMPLIFY";
+        if (followup === "example") action = "PROVIDE_EXAMPLE";
+        if (followup === "quiz") action = "START_QUIZ";
+        if (replyIntent === "DONT_KNOW") action = "SIMPLIFY";
       }
 
       session.tutor.turnsSinceCheck += 1;
-      if (action === "START_QUIZ" || afterExplainShouldCheck(session.tutor, reply, action)) {
+      const skipScriptedQuiz =
+        replyIntent === "CLOSING" ||
+        replyIntent === "DONT_KNOW" ||
+        action === "SIMPLIFY" ||
+        isBareAcknowledgement(utterance);
+      const scriptedQuiz =
+        !skipScriptedQuiz &&
+        !config.naturalCheckins &&
+        (action === "START_QUIZ" || afterExplainShouldCheck(session.tutor, reply, action));
+      if (scriptedQuiz) {
         const q = await this.questions.fromTextbook(
           session.tutor.currentConcept || session.scope.subject,
           reply,
@@ -642,7 +740,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     live.fillerEndsAt = 0;
   }
 
-  private armFiller(live: Live, turnId: number, intent: FillerIntent): void {
+  private armFiller(live: Live, turnId: number, intent: FillerIntent, utterance: string): void {
     if (!config.thinkingFiller) return;
     this.clearFiller(live);
     if (!live.fillerCohort) return;
@@ -652,7 +750,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     }
     live.fillerTimer = setTimeout(() => {
       live.fillerTimer = null;
-      this.playFiller(live, turnId, intent);
+      this.playFiller(live, turnId, intent, utterance);
     }, config.fillerDelayMs);
   }
 
@@ -660,7 +758,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
    * Best-effort only. Every exit logs why and returns; a filler that cannot
    * play must never disturb the turn that is still producing the real answer.
    */
-  private playFiller(live: Live, turnId: number, intent: FillerIntent): void {
+  private playFiller(live: Live, turnId: number, intent: FillerIntent, utterance: string): void {
     const sessionId = live.sessionId;
     try {
       if (live.turnId !== turnId || live.abort.signal.aborted) return;
@@ -669,7 +767,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         return;
       }
       if (!live.emitPcm) return;
-      const clip = this.filler.take(sessionId, intent);
+      const clip = this.filler.take(sessionId, intent, utterance);
       if (!clip) {
         voiceLog("filler_skipped", { sessionId, fillerReason: "no_clip" });
         return;
@@ -679,6 +777,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       if (live.turnId !== turnId || live.answerAudioStarted) return;
 
       live.fillerEndsAt = Date.now() + clip.durationMs;
+      live.lastFillerPhrase = clip.phrase;
       // Reusing ai_started_speaking keeps the client unchanged: it mutes the
       // mic uplink (no echo into STT) and arms barge-in. No transcript event,
       // so the filler never appears as an assistant message.
@@ -730,6 +829,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     speech: SpeechStream;
     signal?: AbortSignal;
     query: string;
+    followup?: string;
     /**
      * True on the plain-question path, where an answer of "I couldn't find
      * this in your chapter" gets swapped for MSG.notInTextbook afterwards.
@@ -737,14 +837,32 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
      * speaking text the caller is about to discard.
      */
     guardNotFound: boolean;
-  }): Promise<{ answer: string; retrievedIds: string[]; pages: number[]; ms: number }> {
-    const { session, live, speech, signal, query } = opts;
+  }): Promise<RagResult> {
+    const { session, live, speech, signal, query, followup = "none" } = opts;
     const history: ChatTurn[] = session.summary
       ? [{ role: "assistant", content: session.summary }, ...session.recentMessages]
       : session.recentMessages;
-    const ask = { token: session.accessToken, query, scope: session.scope, history, signal };
+    const ask = {
+      token: session.accessToken,
+      query,
+      scope: session.scope,
+      history,
+      signal,
+      tutorState: session.tutorState,
+      explainedPoints: session.explainedPoints,
+      quizPending: session.tutor.awaitingAnswer,
+      quizQuestion: session.lastQuizQuestion,
+      quizAttempts: session.quizAttempts,
+      nestIntent: this.ragNestIntent(session, followup),
+      fillerPhrasePlayed: live?.lastFillerPhrase || session.lastFillerPhrase,
+      affectTrajectory: session.affectTrajectory,
+    };
 
-    if (!this.streaming(live)) return this.safeRag(ask);
+    if (!this.streaming(live)) {
+      const result = await this.safeRag(ask, live);
+      if (result.images.length) opts.live?.emit("related_images", { images: result.images });
+      return result;
+    }
 
     // Once anything has been dispatched the turn is committed to streaming:
     // the caller will only speak the tail, so every fallback below has to put
@@ -770,6 +888,11 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
           if (spoken > 0) this.log.warn("rag replaced the answer after audio started");
           else heldBack = true;
         },
+        onRelatedImages: (images) => {
+          if (!live || !images.length) return;
+          if (!turnStillActive(signal, speech.turnId, live.turnId)) return;
+          live.emit("related_images", { images });
+        },
       });
       if (committed && spoken === 0 && !opts.guardNotFound && result.answer) {
         this.streamSay(live, session, speech, result.answer);
@@ -777,19 +900,34 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       return result;
     } catch (err) {
       if (signal?.aborted) throw err;
+      if (err instanceof RagAuthError) {
+        this.log.warn("rag stream auth expired");
+        this.emitAuthExpired(live);
+        if (committed) this.streamSay(live, session, speech, MSG.authExpired);
+        return { answer: MSG.authExpired, retrievedIds: [], pages: [], images: [], ms: 0 };
+      }
       this.log.warn(`rag stream ${err}`);
       if (committed) this.streamSay(live, session, speech, MSG.ragFail);
-      return { answer: MSG.ragFail, retrievedIds: [], pages: [], ms: 0 };
+      return { answer: MSG.ragFail, retrievedIds: [], pages: [], images: [], ms: 0 };
     }
   }
 
-  private async safeRag(ask: Parameters<RagClient["ask"]>[0]) {
+  private emitAuthExpired(live: Live | undefined): void {
+    live?.emit("token_expired", { message: MSG.authExpired });
+  }
+
+  private async safeRag(ask: Parameters<RagClient["ask"]>[0], live?: Live): Promise<RagResult> {
     try {
       return await this.rag.ask(ask);
     } catch (err) {
       if (ask.signal?.aborted) throw err;
+      if (err instanceof RagAuthError) {
+        this.log.warn("rag auth expired");
+        this.emitAuthExpired(live);
+        return { answer: MSG.authExpired, retrievedIds: [], pages: [], images: [], ms: 0 };
+      }
       this.log.warn(`rag ${err}`);
-      return { answer: MSG.ragFail, retrievedIds: [], pages: [], ms: 0 };
+      return { answer: MSG.ragFail, retrievedIds: [], pages: [], images: [], ms: 0 };
     }
   }
 
@@ -857,7 +995,18 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     const cancelled = (): boolean =>
       !turnStillActive(signal, turnId, live.turnId) || live.abort.signal.aborted;
     if (cancelled()) return false;
-    const { pcm, sampleRate } = await this.tts.synthesize(chunk, session.accessToken);
+    const say = speakable(chunk);
+    if (!say) return true;
+    let pcm: Float32Array;
+    let sampleRate: number;
+    try {
+      ({ pcm, sampleRate } = await this.tts.synthesize(say, session.accessToken));
+    } catch (err) {
+      if (/http 401|http 403/.test(String(err))) {
+        this.emitAuthExpired(live);
+      }
+      throw err;
+    }
     // Synthesis is a network round trip with Edge TTS — the student may well
     // have barged in while it was out.
     if (cancelled()) return false;
@@ -885,6 +1034,9 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
   private async endSpeech(live: Live, session: VoiceSession): Promise<void> {
     live.emitPcm?.(packPcm(new Int16Array(0), PCM_SAMPLE_RATE, true));
     live.speaking = false;
+    live.lastSpokeAt = Date.now();
+    live.chunks = [];
+    live.vad.reset();
     if (!live.abort.signal.aborted) {
       session.state = "LISTENING";
       await this.memory.save(session);
@@ -916,14 +1068,37 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     }
     await this.endSpeech(live, session);
   }
-}
 
-/** Maps the tutor's own intent signals onto an acknowledgement category. */
-function fillerIntentFor(action: string, intent: string): FillerIntent {
-  if (action === "EVALUATE") return "evaluate";
-  if (intent === "simplify" || intent === "example" || intent === "repeat") return "followup";
-  if (action === "EXPLAIN" || action === "ANSWER_QUESTION") return "question";
-  return "general";
+  private ragNestIntent(
+    session: VoiceSession,
+    followup: string,
+  ): import("../tutor/interfaces").NestFollowupIntent | undefined {
+    if (!config.naturalCheckins) {
+      return followup !== "none" ? (followup as import("../tutor/interfaces").NestFollowupIntent) : undefined;
+    }
+    if (followup !== "none") return followup as import("../tutor/interfaces").NestFollowupIntent;
+    if (session.tutor.turnsSinceCheck >= 2) return "quiz";
+    return undefined;
+  }
+
+  private applyVoiceMeta(
+    session: VoiceSession,
+    meta: import("../tutor/interfaces").RagVoiceMeta,
+    live?: Live,
+  ): void {
+    if (meta.tutor_state) {
+      session.tutorState = meta.tutor_state as import("../tutor/interfaces").FastApiTutorState;
+    }
+    if (meta.explained_points?.length) {
+      session.explainedPoints = meta.explained_points;
+    }
+    if (meta.affect_trajectory?.length) {
+      session.affectTrajectory = meta.affect_trajectory;
+    }
+    if (meta.affect_hint && live) {
+      live.emit("affect_hint", { hint: meta.affect_hint, primary: meta.affect_primary });
+    }
+  }
 }
 
 function concat(parts: Int16Array[]): Int16Array {

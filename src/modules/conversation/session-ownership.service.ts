@@ -1,5 +1,5 @@
 import { Injectable, Logger, OnModuleDestroy } from "@nestjs/common";
-import Redis from "ioredis";
+import { createRedisClient } from "../../common/redis-client";
 import { instanceId } from "../../common/instance-id";
 import { config } from "../../config";
 
@@ -11,31 +11,8 @@ const ownerKey = (sessionId: string) => `voice:owner:${sessionId}`;
 export class SessionOwnershipService implements OnModuleDestroy {
   private readonly log = new Logger(SessionOwnershipService.name);
   private readonly owner = instanceId();
-  private redis: Redis | null = null;
+  private redis = createRedisClient("SessionOwnership");
   private redisUp = false;
-
-  constructor() {
-    try {
-      this.redis = new Redis(config.redisUrl, {
-        maxRetriesPerRequest: 1,
-        lazyConnect: true,
-        connectTimeout: 2000,
-        commandTimeout: 2000,
-        enableOfflineQueue: false,
-      });
-      this.redis
-        .connect()
-        .then(() => {
-          this.redisUp = true;
-        })
-        .catch((err) => {
-          this.log.warn(`redis ownership unavailable: ${err}`);
-          this.redis = null;
-        });
-    } catch {
-      this.redis = null;
-    }
-  }
 
   get instance(): string {
     return this.owner;
@@ -46,9 +23,10 @@ export class SessionOwnershipService implements OnModuleDestroy {
   }
 
   async ping(): Promise<boolean> {
-    if (!this.redis) return false;
+    const r = this.redis;
+    if (!r) return false;
     try {
-      const pong = await this.redis.ping();
+      const pong = await r.client.ping();
       this.redisUp = pong === "PONG";
       return this.redisUp;
     } catch {
@@ -59,16 +37,17 @@ export class SessionOwnershipService implements OnModuleDestroy {
 
   /** Claim live WS ownership for this instance. */
   async claim(sessionId: string): Promise<ClaimResult> {
-    if (!this.redis) return "no_redis";
+    const r = this.redis;
+    if (!r) return "no_redis";
     const k = ownerKey(sessionId);
     try {
-      const current = await this.redis.get(k);
+      const current = await r.client.get(k);
       if (current === this.owner) {
-        await this.redis.expire(k, config.sessionTtlSec);
+        await r.client.expire(k, config.sessionTtlSec);
         return "ok";
       }
       if (current) return "owned_elsewhere";
-      const ok = await this.redis.set(k, this.owner, "EX", config.sessionTtlSec, "NX");
+      const ok = await r.client.set(k, this.owner, "EX", config.sessionTtlSec, "NX");
       return ok === "OK" ? "ok" : "owned_elsewhere";
     } catch (err) {
       this.log.warn(`claim ${sessionId}: ${err}`);
@@ -77,10 +56,11 @@ export class SessionOwnershipService implements OnModuleDestroy {
   }
 
   async release(sessionId: string): Promise<void> {
-    if (!this.redis) return;
+    const r = this.redis;
+    if (!r) return;
     const k = ownerKey(sessionId);
     try {
-      await this.redis.eval(
+      await r.client.eval(
         "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
         1,
         k,
@@ -92,15 +72,16 @@ export class SessionOwnershipService implements OnModuleDestroy {
   }
 
   async getOwner(sessionId: string): Promise<string | null> {
-    if (!this.redis) return null;
+    const r = this.redis;
+    if (!r) return null;
     try {
-      return await this.redis.get(ownerKey(sessionId));
+      return await r.client.get(ownerKey(sessionId));
     } catch {
       return null;
     }
   }
 
   async onModuleDestroy(): Promise<void> {
-    await this.redis?.quit();
+    await this.redis?.client.quit();
   }
 }

@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnModuleDestroy } from "@nestjs/common";
-import Redis from "ioredis";
+import { createRedisClient } from "../../common/redis-client";
 import { config } from "../../config";
-import { ChatTurn, SessionScope, TutorSnapshot, VoiceState } from "../tutor/interfaces";
+import { ChatTurn, FastApiTutorState, SessionScope, TutorSnapshot, VoiceState } from "../tutor/interfaces";
 import { defaultSnapshot } from "../tutor/tutor-state.service";
 
 export type VoiceSession = {
@@ -16,59 +16,76 @@ export type VoiceSession = {
   summary: string;
   currentTopic: string;
   startedAt: number;
+  /** FastAPI voice tutor state machine */
+  tutorState: FastApiTutorState;
+  explainedPoints: string[];
+  affectTrajectory: string[];
+  quizAttempts: number;
+  lastQuizQuestion: string;
+  lastFillerPhrase: string;
 };
 
 const key = (id: string) => `voice:rtc:${id}`;
-const WINDOW = 12;
+const WINDOW = 14;
+const MAX_REDIS_FAILURES = 3;
 
 @Injectable()
 export class ConversationMemoryService implements OnModuleDestroy {
   private readonly log = new Logger(ConversationMemoryService.name);
-  private redis: Redis | null = null;
+  private redis = createRedisClient("ConversationMemory");
+  private redisFailures = 0;
   private readonly mem = new Map<string, VoiceSession>();
 
-  constructor() {
-    try {
-      this.redis = new Redis(config.redisUrl, {
-        maxRetriesPerRequest: 1,
-        lazyConnect: true,
-        connectTimeout: 2000,
-        commandTimeout: 2000,
-        enableOfflineQueue: false,
-      });
-      this.redis.connect().catch((err) => {
-        this.log.warn(`redis unavailable, memory only: ${err}`);
-        this.redis = null;
-      });
-    } catch {
-      this.redis = null;
-    }
+  async onModuleDestroy(): Promise<void> {
+    await this.redis?.client.quit();
   }
 
-  async onModuleDestroy(): Promise<void> {
-    await this.redis?.quit();
+  private disableRedis(reason: string): void {
+    this.redis?.disable(reason);
+    this.redis = null;
   }
 
   async save(session: VoiceSession): Promise<void> {
     session.recentMessages = session.recentMessages.slice(-WINDOW);
     this.mem.set(session.id, session);
-    if (!this.redis) return;
-    void this.redis
+    const r = this.redis;
+    if (!r) return;
+    void r.client
       .set(key(session.id), JSON.stringify(session), "EX", config.sessionTtlSec)
-      .catch((err) => this.log.debug(`redis save skip: ${err}`));
+      .then(() => {
+        this.redisFailures = 0;
+      })
+      .catch((err) => {
+        this.redisFailures += 1;
+        if (this.redisFailures >= MAX_REDIS_FAILURES) {
+          this.disableRedis(String(err));
+          return;
+        }
+        this.log.debug(`redis save skip (${this.redisFailures}/${MAX_REDIS_FAILURES}): ${err}`);
+      });
   }
 
   async get(id: string): Promise<VoiceSession | null> {
     const hit = this.mem.get(id);
     if (hit) return hit;
-    if (!this.redis) return null;
+    const r = this.redis;
+    if (!r) return null;
     try {
-      const raw = await this.redis.get(key(id));
+      const raw = await r.client.get(key(id));
       if (!raw) return null;
       const session = JSON.parse(raw) as VoiceSession;
+      session.tutorState = session.tutorState ?? "TEACHING";
+      session.explainedPoints = session.explainedPoints ?? [];
+      session.affectTrajectory = session.affectTrajectory ?? [];
+      session.quizAttempts = session.quizAttempts ?? 0;
+      session.lastQuizQuestion = session.lastQuizQuestion ?? "";
+      session.lastFillerPhrase = session.lastFillerPhrase ?? "";
       this.mem.set(id, session);
+      this.redisFailures = 0;
       return session;
-    } catch {
+    } catch (err) {
+      this.redisFailures += 1;
+      if (this.redisFailures >= MAX_REDIS_FAILURES) this.disableRedis(String(err));
       return null;
     }
   }
@@ -76,13 +93,13 @@ export class ConversationMemoryService implements OnModuleDestroy {
   async drop(id: string): Promise<void> {
     this.mem.delete(id);
     try {
-      await this.redis?.del(key(id));
+      await this.redis?.client.del(key(id));
     } catch {
       /* ignore */
     }
   }
 
-  create(partial: Omit<VoiceSession, "tutor" | "recentMessages" | "summary" | "state" | "currentTopic" | "startedAt"> & Partial<VoiceSession>): VoiceSession {
+  create(partial: Omit<VoiceSession, "tutor" | "recentMessages" | "summary" | "state" | "currentTopic" | "startedAt" | "tutorState" | "explainedPoints" | "affectTrajectory" | "quizAttempts" | "lastQuizQuestion" | "lastFillerPhrase"> & Partial<VoiceSession>): VoiceSession {
     return {
       tutor: defaultSnapshot(),
       recentMessages: [],
@@ -90,6 +107,12 @@ export class ConversationMemoryService implements OnModuleDestroy {
       state: "IDLE",
       currentTopic: "",
       startedAt: Date.now(),
+      tutorState: "TEACHING",
+      explainedPoints: [],
+      affectTrajectory: [],
+      quizAttempts: 0,
+      lastQuizQuestion: "",
+      lastFillerPhrase: "",
       ...partial,
     };
   }

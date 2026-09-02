@@ -1,6 +1,6 @@
 import type { ChatTurn } from "./interfaces";
 
-const FOLLOWUP = /^(why|how|what about|and)\b/i;
+const FOLLOWUP = /^(why|how|what about|and|who)\b/i;
 const DEIXIS = /\b(it|they|them|this|that|those|these)\b/i;
 const SIMPLIFY = /\b(simpler|simply|easier|too hard|don'?t understand|explain that)\b/i;
 const EXAMPLE = /\b(example|for instance)\b/i;

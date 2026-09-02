@@ -6,7 +6,7 @@ import { ISTTProvider } from "../interfaces/voice-provider";
 @Injectable()
 export class WhisperSttProvider implements ISTTProvider, OnModuleInit {
   private readonly log = new Logger(WhisperSttProvider.name);
-  private pipe: ((input: unknown) => Promise<unknown>) | null = null;
+  private pipe: ((input: unknown, opts?: unknown) => Promise<unknown>) | null = null;
   private loading: Promise<void> | null = null;
 
   async onModuleInit(): Promise<void> {
@@ -19,7 +19,7 @@ export class WhisperSttProvider implements ISTTProvider, OnModuleInit {
       this.loading = (async () => {
         const { pipeline } = await import("@huggingface/transformers");
         const asr = await pipeline("automatic-speech-recognition", config.whisperModel);
-        this.pipe = (input: unknown) => asr(input as never) as Promise<unknown>;
+        this.pipe = (input: unknown, opts?: unknown) => asr(input as never, opts as never) as Promise<unknown>;
         this.log.log(`whisper ready ${config.whisperModel}`);
       })();
     }
@@ -30,11 +30,22 @@ export class WhisperSttProvider implements ISTTProvider, OnModuleInit {
     await this.warm();
     if (!this.pipe) throw new Error("stt unavailable");
     const audio = sampleRate === 16000 ? pcm : resample(pcm, sampleRate, 16000);
+    const opts = {
+      return_timestamps: false,
+      chunk_length_s: 30,
+      stride_length_s: 5,
+      language: "english",
+      task: "transcribe",
+    };
     let out: unknown;
     try {
-      out = await this.pipe({ array: audio, sampling_rate: 16000 });
+      out = await this.pipe({ array: audio, sampling_rate: 16000 }, opts);
     } catch {
-      out = await this.pipe(audio);
+      try {
+        out = await this.pipe({ array: audio, sampling_rate: 16000 });
+      } catch {
+        out = await this.pipe(audio);
+      }
     }
     if (typeof out === "string") return out.trim();
     const text = (out as { text?: string })?.text || "";

@@ -3,32 +3,29 @@ import { config } from "../../config";
 import { voiceLog } from "../../common/logger";
 import { floatToInt16, packPcm, PCM_SAMPLE_RATE, resample } from "../../audio/pcm";
 import { TtsProvider } from "./providers/tts.provider";
+import { FillerCategory } from "./quick-affect";
 
 /**
  * Short spoken acknowledgements played while a slow turn is still working.
  *
  * Purely a perceived-latency device: the clip never becomes an assistant
  * message, never reaches RAG/LLM context, and never emits a transcript.
- *
- * Synthesis goes through TtsProvider (not Kokoro directly) so the filler uses
- * whatever voice the tutor is actually speaking with — with TTS_PROVIDER=edge
- * that is en-IN, and a Kokoro-only cache would switch accent mid-turn.
- *
- * ponytail: the cache cannot be warmed in onModuleInit because Edge TTS is a
- * call into FastAPI's /auth/voice-tts-pcm, which requires a student JWT that
- * does not exist at boot. It is warmed from the first session instead, so the
- * first turn after a restart may skip the filler (logged as no_clip).
- * Upgrade path: pre-generate the frames offline and load them at startup.
  */
 
-/** Which acknowledgement fits the turn. Derived from intent the tutor already computed. */
-export type FillerIntent = "question" | "followup" | "evaluate" | "general";
+export type FillerIntent = FillerCategory;
 
 export const FILLER_PHRASES: Record<FillerIntent, readonly string[]> = {
-  question: ["Good question.", "Good one. Let me check."],
+  question: ["Let me look at that.", "Here's the idea.", "Looking at this."],
   followup: ["Sure, let me explain that.", "Okay, let's look at this again."],
-  evaluate: ["Let me see.", "Let me check your answer."],
-  general: ["Let me think about that.", "Right, let's break it down."],
+  evaluate: ["Let me check that.", "One moment — let me see."],
+  confused: ["That's okay — one sec.", "No worries, let me try again."],
+  frustrated: ["I hear you — give me a moment.", "Let's slow down together."],
+  bored: ["Fair enough — let me switch it up.", "Got it, let's make this fun."],
+  excited: ["Love that energy — one moment.", "Nice — let's see."],
+  personal: ["Oh nice — let me connect that.", "Good example — one sec."],
+  affirmation: ["Nice — building on that.", "Great, let's keep going."],
+  closing: [],
+  general: ["One moment.", "Let me think.", "Okay."],
 };
 
 /** Every distinct phrase, for cache warming. */
@@ -43,6 +40,24 @@ export type FillerClip = { phrase: string; frame: Buffer; durationMs: number };
 export function pickPhraseIndex(count: number, lastIndex: number): number {
   if (count <= 0) return -1;
   return (((lastIndex + 1) % count) + count) % count;
+}
+
+function hashUtterance(text: string): number {
+  let h = 0;
+  const s = text.trim().toLowerCase();
+  for (let i = 0; i < s.length; i++) {
+    h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h);
+}
+
+/** Seed phrase choice from what the student said; avoid back-to-back repeats. */
+export function pickPhraseForTurn(count: number, lastIndex: number, utterance: string): number {
+  if (count <= 0) return -1;
+  if (count === 1) return 0;
+  const seeded = hashUtterance(utterance) % count;
+  if (seeded !== lastIndex) return seeded;
+  return pickPhraseIndex(count, lastIndex);
 }
 
 export function clipDurationMs(sampleCount: number, sampleRate = PCM_SAMPLE_RATE): number {
@@ -60,14 +75,6 @@ export function median(values: number[]): number {
   return sorted.length % 2 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
 }
 
-/**
- * Phase 2 adaptive gating.
- *
- * The delay itself does not need tuning — a filler is already cancelled the
- * instant the answer's first frame ships, so an early timer is self-correcting.
- * What is worth adapting is whether to arm at all: a session whose answers
- * reliably beat the delay only ever produces near-misses, so stop trying.
- */
 export function shouldArmFiller(
   recentTtfaMs: number[],
   delayMs: number,
@@ -77,10 +84,6 @@ export function shouldArmFiller(
   return median(recentTtfaMs) > delayMs;
 }
 
-/**
- * Stable per-student A/B split, so "did the filler help?" can be answered by
- * comparing ttfaMs across cohorts. A student never flips mid-session.
- */
 export function inFillerCohort(studentId: string, rate: number): boolean {
   if (rate >= 1) return true;
   if (rate <= 0) return false;
@@ -104,16 +107,11 @@ export class ThinkingFillerService {
 
   constructor(private readonly tts: TtsProvider) {}
 
-  /** Cache identity: re-synthesizes if the engine or voice is switched. */
   private voiceKey(): string {
     const voice = config.ttsProvider === "edge" ? config.edgeTtsVoice : config.kokoroVoice;
     return `${config.ttsProvider}:${voice}`;
   }
 
-  /**
-   * Fire-and-forget from session create. Safe to call repeatedly: it warms
-   * once per voice, and a failed attempt is retried by the next session.
-   */
   warm(accessToken: string): void {
     if (!config.thinkingFiller) return;
     const key = this.voiceKey();
@@ -151,7 +149,6 @@ export class ThinkingFillerService {
     if (!pcm.length) return null;
     const at16 = resample(pcm, sampleRate, PCM_SAMPLE_RATE);
     const durationMs = clipDurationMs(at16.length);
-    // Dropped rather than truncated — a clipped word sounds like a bug.
     if (durationMs > config.fillerMaxDurationMs) {
       this.log.warn(`filler "${phrase}" is ${durationMs}ms, over the cap — dropped`);
       return null;
@@ -159,22 +156,18 @@ export class ThinkingFillerService {
     return { phrase, durationMs, frame: packPcm(floatToInt16(at16), PCM_SAMPLE_RATE, false) };
   }
 
-  /** True when this student is in the cohort that hears fillers at all. */
   enabledFor(studentId: string): boolean {
     return config.thinkingFiller && inFillerCohort(studentId, config.fillerSampleRate);
   }
 
-  /** Phase 2: skip arming for sessions whose answers reliably beat the delay. */
   shouldArm(recentTtfaMs: number[]): boolean {
     if (!config.fillerAdaptive) return true;
     return shouldArmFiller(recentTtfaMs, config.fillerDelayMs);
   }
 
-  /**
-   * Next clip for this session, or null when disabled, capped, or not cached.
-   * Counts against the session cap only when a clip is actually handed out.
-   */
-  take(sessionId: string, intent: FillerIntent = "general"): FillerClip | null {
+  take(sessionId: string, intent: FillerIntent = "general", utterance = ""): FillerClip | null {
+    const phrases = FILLER_PHRASES[intent] ?? FILLER_PHRASES.general;
+    if (!phrases.length) return null;
     const st = this.state.get(sessionId) ?? { lastIndex: {}, used: 0 };
     if (
       !fillerAllowed({
@@ -185,13 +178,12 @@ export class ThinkingFillerService {
     ) {
       return null;
     }
-    const phrases = FILLER_PHRASES[intent] ?? FILLER_PHRASES.general;
     const key = this.voiceKey();
     const last = st.lastIndex[intent] ?? -1;
-    // Walk forward from the rotation position so a partially warmed cache
-    // still speaks instead of falling back to silence.
+    const start = pickPhraseForTurn(phrases.length, last, utterance);
     for (let i = 0; i < phrases.length; i++) {
-      const idx = pickPhraseIndex(phrases.length, last + i);
+      const idx = (start + i) % phrases.length;
+      if (idx === last && phrases.length > 1) continue;
       const clip = this.cache.get(`${key}:${phrases[idx]}`);
       if (!clip) continue;
       this.state.set(sessionId, {

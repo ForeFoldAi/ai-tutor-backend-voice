@@ -8,7 +8,7 @@
     "start:dev": "nest start --watch",
     "start:prod": "node dist/main.js",
     "build": "nest build",
-    "test": "node --import tsx --test src/modules/tutor/tutor.spec.ts src/modules/rag/rag.spec.ts src/audio/pcm.spec.ts src/audio/sentences.spec.ts src/audio/vad.spec.ts src/modules/tutor/recall.spec.ts src/modules/tutor/chapter-query.spec.ts src/modules/voice/thinking-filler.spec.ts src/modules/tutor/turn-commit.spec.ts src/modules/tutor/turn-routing.spec.ts src/modules/voice/transcript-events.spec.ts src/modules/conversation/session-ownership.spec.ts src/common/production-config.spec.ts",
+    "test": "node --import tsx --test src/modules/tutor/tutor.spec.ts src/modules/tutor/reply-intent.spec.ts src/modules/rag/rag.spec.ts src/audio/pcm.spec.ts src/audio/sentences.spec.ts src/audio/vad.spec.ts src/modules/tutor/recall.spec.ts src/modules/tutor/chapter-query.spec.ts src/modules/voice/thinking-filler.spec.ts src/modules/voice/quick-affect.spec.ts src/modules/voice/stt-quality.spec.ts src/modules/tutor/turn-commit.spec.ts src/modules/tutor/turn-routing.spec.ts src/modules/voice/transcript-events.spec.ts src/modules/conversation/session-ownership.spec.ts src/common/production-config.spec.ts",
     "smoke": "node smoke.mjs"
   },
   "dependencies": {
