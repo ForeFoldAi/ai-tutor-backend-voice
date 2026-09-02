@@ -21,6 +21,8 @@ export function createRedisClient(label: string): RedisHandle | null {
       commandTimeout: config.redisCommandTimeoutMs,
       enableOfflineQueue: false,
     });
+    // ponytail: ioredis emits 'error' on DNS/refused; unhandled events can crash Node during deploy.
+    client.on("error", (err) => log.debug(`${label}: ${err.message}`));
     client.connect().catch((err) => {
       log.warn(`${label}: connect failed, memory only: ${err}`);
       client.disconnect();
