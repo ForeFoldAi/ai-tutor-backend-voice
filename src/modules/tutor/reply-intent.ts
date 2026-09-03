@@ -20,7 +20,7 @@ export const AFFIRM_RE =
 const ACK_RE =
   /^(laughing|laughs|laughter|haha+|ha\s+ha|hehe+|lol|lmao|okay|ok|yes|yeah|yep|yup|sure|right|hmm+|mm+|mhm+|uh-?huh|wow|whoa|interesting|nice|cool|i\s+see|got\s+it|makes\s+sense|i\s+understand|understood)$/i;
 const ACK_EDU_RE =
-  /\b(tell\s+me\s+more|explain|why|what|who|where|when|how|continue|go\s+on|more\s+about|did\s+it|does\s+it|quiz|example|simplify)\b/i;
+  /\b(tell\s+me\s+more|explain|why|what|who|where|when|how|continue|go\s+on|more\s+about|did\s+it|does\s+it|quiz|simplify|(?:give|another|an|more|some)\s+examples?|examples?\s+(?:of|please|from))\b/i;
 
 function ackNorm(text: string): string {
   return (text || "")
@@ -30,17 +30,34 @@ function ackNorm(text: string): string {
     .trim();
 }
 
+/** Praise of the tutor's example ("okay, a nice example") — not a request for one. */
+const EXAMPLE_PRAISE_RE =
+  /^(?:(?:ok|okay|yes|yeah|yep|sure)\s+)?(?:a\s+)?(?:nice|good|great|cool|lovely)\s+example(?:\s+(?:thanks|thank\s+you))?$/i;
+
+/** Self-intro — not a curriculum topic ("I am Seyun, D-E-L-H-I"). */
+const PERSONAL_INTRO_RE =
+  /^(?:(?:hi|hello|hey)[,!]?\s+)?(?:i(?:'m|\s+am)|my\s+name\s+is|this\s+is)\s+/i;
+
+export function isPersonalIntro(utterance: string): boolean {
+  const q = ackNorm(utterance);
+  return q.length > 0 && q.length <= 80 && PERSONAL_INTRO_RE.test(q);
+}
+
 /** Bare laugh / okay / wow — not a question and not a quiz answer. */
 export function isBareAcknowledgement(utterance: string): boolean {
   const q = ackNorm(utterance);
-  if (!q || ACK_EDU_RE.test(q)) return false;
+  if (!q) return false;
+  if (EXAMPLE_PRAISE_RE.test(q)) return true;
+  if (ACK_EDU_RE.test(q)) return false;
   return ACK_RE.test(q);
 }
 
 export function ackReply(utterance: string): string {
   const q = ackNorm(utterance);
   if (/laugh|haha|hehe|lol/.test(q)) return "Glad you're enjoying it!";
-  if (/wow|whoa|interesting|nice|cool/.test(q)) return "Glad you found that interesting.";
+  if (/wow|whoa|interesting|nice|cool|good\s+example|nice\s+example/.test(q)) {
+    return "Glad you found that helpful.";
+  }
   return "Alright.";
 }
 

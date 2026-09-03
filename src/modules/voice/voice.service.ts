@@ -15,7 +15,7 @@ import { nextDifficulty } from "../tutor/difficulty-manager.service";
 import { QueryRewriterService } from "../tutor/query-rewriter.service";
 import { QuestionGeneratorService } from "../tutor/question-generator.service";
 import { afterEvaluate, afterExplainShouldCheck, decideAction } from "../tutor/tutor-orchestrator.service";
-import { classifyReplyIntent, isBareAcknowledgement, ackReply } from "../tutor/reply-intent";
+import { classifyReplyIntent, isBareAcknowledgement, ackReply, isPersonalIntro } from "../tutor/reply-intent";
 import { followupIntent, isRecallQuestion, topicFromQuestion } from "../tutor/query-rewriter";
 import { NestFollowupIntent } from "../tutor/interfaces";
 import { RecallService } from "../tutor/recall.service";
@@ -111,6 +111,11 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
   private readonly live = new Map<string, Live>();
   private current: string | null = null;
   private draining = false;
+  /** Session waits for client token_update after RagAuthError (resolve with fresh JWT or null). */
+  private readonly tokenRefreshWaiters = new Map<
+    string,
+    { resolve: (token: string | null) => void; timer: ReturnType<typeof setTimeout> }
+  >();
 
   constructor(
     private readonly memory: ConversationMemoryService,
@@ -184,7 +189,30 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     session.accessToken = token;
     await this.memory.save(session);
     this.filler.warm(token);
+    const waiter = this.tokenRefreshWaiters.get(sessionId);
+    if (waiter) {
+      clearTimeout(waiter.timer);
+      this.tokenRefreshWaiters.delete(sessionId);
+      waiter.resolve(token);
+    }
     return true;
+  }
+
+  /** Wait for the client to push token_update after token_expired (or timeout). */
+  private waitForTokenRefresh(sessionId: string, ms = 4000): Promise<string | null> {
+    const existing = this.tokenRefreshWaiters.get(sessionId);
+    if (existing) {
+      clearTimeout(existing.timer);
+      this.tokenRefreshWaiters.delete(sessionId);
+      existing.resolve(null);
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.tokenRefreshWaiters.delete(sessionId);
+        resolve(null);
+      }, ms);
+      this.tokenRefreshWaiters.set(sessionId, { resolve, timer });
+    });
   }
 
   async attachTransport(
@@ -488,6 +516,16 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         // grader is only half the fix — the latch has to stay set too, or
         // the question is silently dropped and never asked again.
         if (session.tutor.awaitingAnswer) reply = `${reply} ${MSG.questionStillOpen}`;
+      } else if (isPersonalIntro(utterance)) {
+        action = "ANSWER";
+        const ch = chapterName || session.scope.subject || "this lesson";
+        reply = `Nice to meet you! What would you like to learn from ${ch}?`;
+      } else if (replyIntent === "CLOSING") {
+        // Don't RAG a wrap-up — retrieval pulls chapter chunks and the model
+        // re-teaches ("That's what's covered here") instead of acknowledging.
+        action = "ANSWER";
+        reply =
+          "You're welcome! Want to keep going with this chapter, try a quick quiz, or wrap up for now?";
       } else if (recall) {
         action = "RECALL";
         reply = await this.recall.answer(utterance, history, session.summary);
@@ -903,6 +941,36 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       if (err instanceof RagAuthError) {
         this.log.warn("rag stream auth expired");
         this.emitAuthExpired(live);
+        const fresh = live ? await this.waitForTokenRefresh(session.id) : null;
+        if (fresh) {
+          ask.token = fresh;
+          session.accessToken = fresh;
+          try {
+            // Buffered retry — streaming already failed mid-turn; one clean answer is enough.
+            const retried = await this.rag.ask(ask);
+            if (committed && spoken === 0 && retried.answer) {
+              this.streamSay(live, session, speech, retried.answer);
+            }
+            return retried;
+          } catch (retryErr) {
+            this.log.warn(`rag stream retry ${retryErr}`);
+            if (committed) {
+              this.streamSay(
+                live,
+                session,
+                speech,
+                retryErr instanceof RagAuthError ? MSG.authExpired : MSG.ragFail,
+              );
+            }
+            return {
+              answer: retryErr instanceof RagAuthError ? MSG.authExpired : MSG.ragFail,
+              retrievedIds: [],
+              pages: [],
+              images: [],
+              ms: 0,
+            };
+          }
+        }
         if (committed) this.streamSay(live, session, speech, MSG.authExpired);
         return { answer: MSG.authExpired, retrievedIds: [], pages: [], images: [], ms: 0 };
       }
@@ -924,6 +992,20 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       if (err instanceof RagAuthError) {
         this.log.warn("rag auth expired");
         this.emitAuthExpired(live);
+        const sid = live?.sessionId;
+        const fresh = sid ? await this.waitForTokenRefresh(sid) : null;
+        if (fresh) {
+          ask.token = fresh;
+          try {
+            return await this.rag.ask(ask);
+          } catch (retryErr) {
+            if (!(retryErr instanceof RagAuthError)) {
+              this.log.warn(`rag retry ${retryErr}`);
+              return { answer: MSG.ragFail, retrievedIds: [], pages: [], images: [], ms: 0 };
+            }
+            this.log.warn("rag auth still expired after refresh");
+          }
+        }
         return { answer: MSG.authExpired, retrievedIds: [], pages: [], images: [], ms: 0 };
       }
       this.log.warn(`rag ${err}`);
