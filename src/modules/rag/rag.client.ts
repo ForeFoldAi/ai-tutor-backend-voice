@@ -24,6 +24,8 @@ export type RagAskOptions = {
   quizQuestion?: string;
   quizAttempts?: number;
   nestIntent?: NestFollowupIntent;
+  /** closing | ack | intro — FastAPI skips chapter RAG; LLM still replies. */
+  dialogueAct?: string;
   fillerPhrasePlayed?: string;
   affectTrajectory?: string[];
 };
@@ -124,6 +126,7 @@ export class RagClient {
     if (opts.quizQuestion) body.quiz_question = opts.quizQuestion;
     if (opts.quizAttempts) body.quiz_attempts = opts.quizAttempts;
     if (opts.nestIntent && opts.nestIntent !== "none") body.nest_intent = opts.nestIntent;
+    if (opts.dialogueAct) body.dialogue_act = opts.dialogueAct;
     if (opts.fillerPhrasePlayed) body.filler_phrase_played = opts.fillerPhrasePlayed;
     if (opts.affectTrajectory?.length) body.affect_trajectory = opts.affectTrajectory;
 

@@ -15,7 +15,8 @@ import { nextDifficulty } from "../tutor/difficulty-manager.service";
 import { QueryRewriterService } from "../tutor/query-rewriter.service";
 import { QuestionGeneratorService } from "../tutor/question-generator.service";
 import { afterEvaluate, afterExplainShouldCheck, decideAction } from "../tutor/tutor-orchestrator.service";
-import { classifyReplyIntent, isBareAcknowledgement, ackReply } from "../tutor/reply-intent";
+import { classifyReplyIntent, isBareAcknowledgement, dialogueActForUtterance } from "../tutor/reply-intent";
+import type { DialogueAct } from "../tutor/reply-intent";
 import { followupIntent, isRecallQuestion, topicFromQuestion } from "../tutor/query-rewriter";
 import { NestFollowupIntent } from "../tutor/interfaces";
 import { RecallService } from "../tutor/recall.service";
@@ -415,6 +416,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     const chapterName = session.scope.chapterNames[0] || session.scope.chapter || "";
     const followup = followupIntent(utterance);
     const replyIntent = classifyReplyIntent(utterance, session.tutor.awaitingAnswer);
+    const dialogueAct = dialogueActForUtterance(utterance, session.tutor.awaitingAnswer);
     if (replyIntent === "CLOSING") session.tutor.awaitingAnswer = false;
     let action = decideAction({
       utterance,
@@ -481,16 +483,29 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       // This wins even while awaiting an answer — "what was the question
       // again?" must not be graded as a wrong answer. awaitingAnswer is left
       // set, so the tutor still expects the real answer next turn.
-      if (!recall && followup === "normal" && isBareAcknowledgement(utterance)) {
-        action = "ANSWER";
-        reply = ackReply(utterance);
-        // Reacting to a check question is not answering it. Skipping the
-        // grader is only half the fix — the latch has to stay set too, or
-        // the question is silently dropped and never asked again.
-        if (session.tutor.awaitingAnswer) reply = `${reply} ${MSG.questionStillOpen}`;
-      } else if (recall) {
+      if (recall) {
         action = "RECALL";
         reply = await this.recall.answer(utterance, history, session.summary);
+      } else if (dialogueAct && action !== "EVALUATE") {
+        // LLM-first: closing / ack / intro — skip rewriter + chapter RAG.
+        // Not used while EVALUATE is active ("yes" must still be graded).
+        action = "ANSWER";
+        const rag = await this.streamRag({
+          session,
+          live,
+          speech,
+          signal,
+          query: utterance,
+          guardNotFound: false,
+          followup: "none",
+          dialogueAct,
+        });
+        ragMs = rag.ms;
+        retrievedIds = rag.retrievedIds;
+        pages = rag.pages;
+        reply = rag.answer;
+        if (rag.voiceMeta) this.applyVoiceMeta(session, rag.voiceMeta, live);
+        if (!reply) reply = MSG.didntCatch;
       } else if (action === "EVALUATE") {
         grade = await this.evaluator.grade(
           session.tutor.expectedAnswer,
@@ -595,6 +610,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       const skipScriptedQuiz =
         replyIntent === "CLOSING" ||
         replyIntent === "DONT_KNOW" ||
+        !!dialogueAct ||
         action === "SIMPLIFY" ||
         isBareAcknowledgement(utterance);
       const scriptedQuiz =
@@ -830,6 +846,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     signal?: AbortSignal;
     query: string;
     followup?: string;
+    dialogueAct?: DialogueAct;
     /**
      * True on the plain-question path, where an answer of "I couldn't find
      * this in your chapter" gets swapped for MSG.notInTextbook afterwards.
@@ -838,7 +855,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
      */
     guardNotFound: boolean;
   }): Promise<RagResult> {
-    const { session, live, speech, signal, query, followup = "none" } = opts;
+    const { session, live, speech, signal, query, followup = "none", dialogueAct } = opts;
     const history: ChatTurn[] = session.summary
       ? [{ role: "assistant", content: session.summary }, ...session.recentMessages]
       : session.recentMessages;
@@ -853,7 +870,8 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       quizPending: session.tutor.awaitingAnswer,
       quizQuestion: session.lastQuizQuestion,
       quizAttempts: session.quizAttempts,
-      nestIntent: this.ragNestIntent(session, followup),
+      nestIntent: dialogueAct ? undefined : this.ragNestIntent(session, followup),
+      dialogueAct,
       fillerPhrasePlayed: live?.lastFillerPhrase || session.lastFillerPhrase,
       affectTrajectory: session.affectTrajectory,
     };

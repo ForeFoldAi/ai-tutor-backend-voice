@@ -1,6 +1,15 @@
+/**
+ * Student reply intent — routing signals only; LLM writes the spoken reply.
+ */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { classifyReplyIntent, isBareAcknowledgement, ackReply } from "./reply-intent";
+import {
+  classifyReplyIntent,
+  isBareAcknowledgement,
+  ackReply,
+  isPersonalIntro,
+  dialogueActForUtterance,
+} from "./reply-intent";
 
 describe("classifyReplyIntent", () => {
   it("detects closing", () => {
@@ -44,8 +53,31 @@ describe("isBareAcknowledgement", () => {
     assert.equal(isBareAcknowledgement("Can you tell me about India's political map?"), false);
   });
 
-  it("returns a short spoken ack", () => {
+  it("treats praise of an example as an ack, not a request for one", () => {
+    assert.equal(isBareAcknowledgement("Okay, a nice example."), true);
+    assert.equal(isBareAcknowledgement("nice example"), true);
+    assert.equal(isBareAcknowledgement("give me an example"), false);
+  });
+
+  it("returns a short spoken ack fallback", () => {
     assert.equal(ackReply("(laughing)"), "Glad you're enjoying it!");
     assert.equal(ackReply("Okay."), "Alright.");
+  });
+});
+
+describe("dialogueActForUtterance", () => {
+  it("routes closing thanks and intro without canned replies", () => {
+    assert.equal(dialogueActForUtterance("thanks for explaining", false), "closing");
+    assert.equal(dialogueActForUtterance("Okay, a nice example.", false), "ack");
+    assert.equal(dialogueActForUtterance("I am Seyun, D-E-L-H-I.", false), "intro");
+    assert.equal(dialogueActForUtterance("What is photosynthesis?", false), null);
+  });
+});
+
+describe("isPersonalIntro", () => {
+  it("detects name introductions", () => {
+    assert.equal(isPersonalIntro("I am Seyun, D-E-L-H-I."), true);
+    assert.equal(isPersonalIntro("My name is Suneel"), true);
+    assert.equal(isPersonalIntro("What are natural resources?"), false);
   });
 });
