@@ -83,6 +83,10 @@ export const config = {
   fillerAdaptive: envBool("VOICE_FILLER_ADAPTIVE", true),
   /** Fraction of students who hear fillers, for measuring the effect. 1 = everyone. */
   fillerSampleRate: envRate("VOICE_FILLER_SAMPLE_RATE", 1),
+  /** Parallel tiny LLM line matched to the student prompt; falls back to canned. */
+  llmFiller: envBool("VOICE_LLM_FILLER", true),
+  /** Must finish before/around fillerDelayMs or we use the canned clip. */
+  llmFillerTimeoutMs: envInt("VOICE_LLM_FILLER_TIMEOUT_MS", 900),
   /** When true, LLM asks check-ins naturally instead of scripted quiz append. */
   naturalCheckins: envBool("VOICE_NATURAL_CHECKINS", false),
   /** Speak each sentence as the LLM writes it instead of waiting for the full answer. */

@@ -30,6 +30,14 @@ export type RagAskOptions = {
   affectTrajectory?: string[];
 };
 
+export type AssistantAskOptions = {
+  token: string;
+  query: string;
+  agentMode: string;
+  history: ChatTurn[];
+  signal?: AbortSignal;
+};
+
 /** FastAPI rejected the bearer token (expired / wrong secret). */
 export class RagAuthError extends Error {
   constructor() {
@@ -220,5 +228,87 @@ export class RagClient {
       if (rest) handlers.onSentence(rest);
     }
     return { answer: answer.trim(), retrievedIds, pages, images, ms: Date.now() - started, voiceMeta };
+  }
+
+  /**
+   * Same body as the Ask AI Tutor text client — no voice_mode / chapter fields.
+   * POST /auth/student/assistant/chat/stream
+   */
+  async askAssistantStream(opts: AssistantAskOptions, handlers: RagStreamHandlers): Promise<RagResult> {
+    const started = Date.now();
+    const body = {
+      query: opts.query,
+      conversation_history: opts.history.slice(-8).map((t) => ({
+        role: t.role,
+        content: t.content,
+      })),
+      agent_mode: opts.agentMode || "free",
+    };
+
+    const res = await fetch(`${config.tutorApiUrl}/auth/student/assistant/chat/stream`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${opts.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: opts.signal,
+    });
+    if (!res.ok) {
+      this.log.warn(`assistant http ${res.status}`);
+      if (res.status === 401 || res.status === 403) throw new RagAuthError();
+      throw new Error("assistant failed");
+    }
+
+    let answer = "";
+    const sentences = new SentenceStream(config.streamFirstChunkChars, config.streamChunkChars);
+
+    const onLine = (line: string): void => {
+      if (!line.trim()) return;
+      let ev: NdjsonEvent;
+      try {
+        ev = JSON.parse(line) as NdjsonEvent;
+      } catch {
+        return;
+      }
+      if (ev.type === "token" && ev.content) {
+        answer += ev.content;
+        if (handlers.onSentence) {
+          for (const chunk of sentences.push(ev.content)) handlers.onSentence(chunk);
+        }
+      }
+    };
+
+    const reader = res.body?.getReader();
+    if (reader) {
+      const decoder = new TextDecoder();
+      let pending = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        pending += decoder.decode(value, { stream: true });
+        let nl = pending.indexOf("\n");
+        while (nl >= 0) {
+          onLine(pending.slice(0, nl));
+          pending = pending.slice(nl + 1);
+          nl = pending.indexOf("\n");
+        }
+      }
+      onLine(pending);
+    } else {
+      for (const line of (await res.text()).split("\n")) onLine(line);
+    }
+
+    if (handlers.onSentence) {
+      const rest = sentences.flush();
+      if (rest) handlers.onSentence(rest);
+    }
+    return {
+      answer: answer.trim(),
+      retrievedIds: [],
+      pages: [],
+      images: [],
+      ms: Date.now() - started,
+    };
   }
 }

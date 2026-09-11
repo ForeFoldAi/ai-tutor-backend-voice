@@ -60,13 +60,20 @@ export class VoiceController {
       studentId: req.user.studentId,
       token,
       scope: {
-        board: body.board,
-        classLevel: body.classLevel,
-        subject: body.subject,
+        board: body.board || "",
+        classLevel: body.classLevel || "",
+        subject: body.subject || "",
         chapterIds: body.chapterIds || [],
         chapterNames: body.chapterNames || [],
         chapter: body.chapter,
       },
+      agentMode:
+        body.agentMode === "free" ||
+        body.agentMode === "ask" ||
+        body.agentMode === "practice" ||
+        body.agentMode === "explain"
+          ? body.agentMode
+          : undefined,
     });
     return {
       id: session.id,

@@ -6,6 +6,8 @@ import assert from "node:assert/strict";
 import {
   classifyReplyIntent,
   isBareAcknowledgement,
+  isUnderstandingPraise,
+  isGreetingOnly,
   ackReply,
   isPersonalIntro,
   dialogueActForUtterance,
@@ -46,6 +48,14 @@ describe("isBareAcknowledgement", () => {
     assert.equal(isBareAcknowledgement("interesting"), true);
   });
 
+  it("treats understanding praise as an ack", () => {
+    assert.equal(isUnderstandingPraise("good explanation"), true);
+    assert.equal(isUnderstandingPraise("I understood it very well"), true);
+    assert.equal(isUnderstandingPraise("that helped a lot"), true);
+    assert.equal(isBareAcknowledgement("it was very clear for me"), true);
+    assert.equal(isBareAcknowledgement("makes perfect sense"), true);
+  });
+
   it("does not treat educational follow-ups as acks", () => {
     assert.equal(isBareAcknowledgement("Tell me more about the Hoysalas."), false);
     assert.equal(isBareAcknowledgement("Did it control all of India?"), false);
@@ -57,6 +67,12 @@ describe("isBareAcknowledgement", () => {
     assert.equal(isBareAcknowledgement("Okay, a nice example."), true);
     assert.equal(isBareAcknowledgement("nice example"), true);
     assert.equal(isBareAcknowledgement("give me an example"), false);
+  });
+
+  it("detects greeting-only turns", () => {
+    assert.equal(isGreetingOnly("Hi"), true);
+    assert.equal(isGreetingOnly("Good morning"), true);
+    assert.equal(isGreetingOnly("Hi, what is a cell?"), false);
   });
 
   it("returns a short spoken ack fallback", () => {
@@ -71,6 +87,8 @@ describe("dialogueActForUtterance", () => {
     assert.equal(dialogueActForUtterance("Okay, a nice example.", false), "ack");
     assert.equal(dialogueActForUtterance("I am Seyun, D-E-L-H-I.", false), "intro");
     assert.equal(dialogueActForUtterance("What is photosynthesis?", false), null);
+    assert.equal(dialogueActForUtterance("good explanation", false), "ack");
+    assert.equal(dialogueActForUtterance("I understood it very well", false), "ack");
   });
 });
 

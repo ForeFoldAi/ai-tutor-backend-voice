@@ -5,7 +5,11 @@ import { voiceLog } from "../../common/logger";
 import { floatToInt16, int16ToFloat, packPcm, PCM_SAMPLE_RATE, resample, unpackPcm } from "../../audio/pcm";
 import { SileroVad, loadSilero } from "../../audio/vad";
 import { speakable } from "../../audio/sentences";
-import { ConversationMemoryService, VoiceSession } from "../conversation/conversation-memory.service";
+import {
+  AssistantAgentMode,
+  ConversationMemoryService,
+  VoiceSession,
+} from "../conversation/conversation-memory.service";
 import { SessionOwnershipService } from "../conversation/session-ownership.service";
 import { ConversationSummaryService } from "../conversation/conversation-summary.service";
 import { ProgressService } from "../progress/progress.service";
@@ -31,8 +35,8 @@ import {
 import { isLikelyEcho, isMeaningfulTranscript, pcmSpeechRms, postprocessTranscript } from "./stt-quality";
 import { WhisperSttProvider } from "./providers/whisper.stt";
 import { TtsProvider } from "./providers/tts.provider";
-import { FillerIntent, ThinkingFillerService } from "./thinking-filler.service";
-import { fillerIntentForTurn } from "./quick-affect";
+import { FillerIntent, PreparedFiller, ThinkingFillerService } from "./thinking-filler.service";
+import { resolveFillerPlan, type FillerPlan } from "./filler-mode";
 import { WebrtcService } from "./webrtc.service";
 import { IVoiceProvider, VoiceSessionHandle } from "./interfaces/voice-provider";
 import { randomUUID } from "crypto";
@@ -54,6 +58,10 @@ type Live = {
   turnId: number;
   /** Arm timer, then reused as the drain timer once the filler is playing. */
   fillerTimer: NodeJS.Timeout | null;
+  /** In-flight LLM/canned clip prep for this turn. */
+  fillerPending: Promise<PreparedFiller | null> | null;
+  /** Plan used to prepare the pending filler (for markUsed / logs). */
+  fillerPlan: FillerPlan | null;
   /** Epoch ms the current filler stops being audible; 0 when none is playing. */
   fillerEndsAt: number;
   /** True once the real answer's first PCM frame is on the wire. */
@@ -68,6 +76,8 @@ type Live = {
   fillerCohort: boolean;
   /** Phrase spoken as thinking filler this turn (for LLM de-duplication). */
   lastFillerPhrase: string;
+  /** Student utterance for the in-flight turn — committed when speech starts. */
+  turnUtterance: string;
   /** Queue one turn at a time per session (pcmQ already serializes VAD; this covers text + STT). */
   turnQ: Promise<void>;
   /** Epoch ms the tutor last finished speaking (echo window). */
@@ -92,6 +102,12 @@ type SpeechStream = {
   signal?: AbortSignal;
   /** Turn that queued this speech; stale after interrupt bumps live.turnId. */
   turnId: number;
+  /** Text spoken so far — mirrored to the transcript as each PCM chunk goes out. */
+  spokenText: string;
+  /** Optional action tag for the progressive assistant transcript. */
+  transcriptAction?: string;
+  /** Once the full reply is published, stop overwriting with speakable prefixes. */
+  transcriptFinal?: boolean;
 };
 
 const TTFA_SAMPLES = 8;
@@ -150,16 +166,24 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     studentId: string;
     token: string;
     scope: SessionScope;
+    agentMode?: AssistantAgentMode;
+    conversationHistory?: ChatTurn[];
   }): Promise<VoiceSession> {
     if (this.draining) throw new Error("server_draining");
     const id = randomUUID();
     const conversationId = randomUUID();
+    const history: ChatTurn[] = (opts.conversationHistory || [])
+      .filter((t) => (t.role === "user" || t.role === "assistant") && Boolean(String(t.content || "").trim()))
+      .map((t) => ({ role: t.role as "user" | "assistant", content: String(t.content).trim() }))
+      .slice(-14);
     const session = this.memory.create({
       id,
       conversationId,
       studentId: opts.studentId,
       accessToken: opts.token,
       scope: opts.scope,
+      agentMode: opts.agentMode,
+      recentMessages: history,
       state: "IDLE",
     });
     await this.memory.save(session);
@@ -169,7 +193,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       studentId: opts.studentId,
       conversationId,
       classLevel: opts.scope.classLevel,
-      subject: opts.scope.subject,
+      subject: opts.scope.subject || opts.agentMode || "assistant",
     });
     // Edge TTS needs a student JWT, so the filler cache cannot warm at boot.
     // First session of the process pays for it, in the background.
@@ -206,6 +230,8 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       pcmQ: Promise.resolve(),
       turnId: 0,
       fillerTimer: null,
+      fillerPending: null,
+      fillerPlan: null,
       fillerEndsAt: 0,
       answerAudioStarted: false,
       turnStartedAt: Date.now(),
@@ -213,6 +239,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       ttfa: [],
       fillerCohort: true,
       lastFillerPhrase: "",
+      turnUtterance: "",
       turnQ: Promise.resolve(),
       lastSpokeAt: 0,
     };
@@ -399,6 +426,19 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     await this.runTurn(sessionId, text, t0);
   }
 
+  /** Fixed-line TTS greet for Ask AI — does not call student_assistant. */
+  async speakAssistantGreeting(sessionId: string): Promise<void> {
+    const text = "Hi! Ask me anything about school or the platform.";
+    const live = this.live.get(sessionId);
+    const session = await this.memory.get(sessionId);
+    if (!session) return;
+    live?.emit("transcript", assistantTranscript(0, text));
+    const greetTurn: ChatTurn = { role: "assistant", content: text };
+    session.recentMessages = [...session.recentMessages, greetTurn].slice(-14);
+    await this.memory.save(session);
+    await this.speak(sessionId, text);
+  }
+
   async runTurn(
     sessionId: string,
     utterance: string,
@@ -411,6 +451,11 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     session.state = "THINKING";
     await this.memory.save(session);
     live?.emit("ai_started_processing");
+
+    if (session.agentMode) {
+      await this.runAssistantTurn(sessionId, utterance, t0, opts);
+      return;
+    }
 
     const history = session.recentMessages;
     const chapterName = session.scope.chapterNames[0] || session.scope.chapter || "";
@@ -437,20 +482,21 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       turnId = ++live.turnId;
       live.answerAudioStarted = false;
       live.turnStartedAt = t0;
+      live.turnUtterance = opts.synthetic ? "" : utterance;
       if (!opts.synthetic) {
         live.emit("transcript", userTranscriptPending(turnId, utterance));
       }
       if (opts.filler !== false) {
-        const { intent: fillerIntent, skip } = fillerIntentForTurn(
+        const plan = resolveFillerPlan({
           utterance,
           action,
           followup,
-          session.tutor.awaitingAnswer,
-        );
-        // Acks answer instantly from a canned line — a "let me think" filler
-        // would land on top of the reply it was supposed to cover.
-        if (!skip && !isBareAcknowledgement(utterance)) {
-          this.armFiller(live, turnId, fillerIntent, utterance);
+          quizPending: session.tutor.awaitingAnswer,
+          currentConcept: session.tutor.currentConcept || session.currentTopic,
+          chapter: chapterName,
+        });
+        if (!plan.skip) {
+          this.armFiller(live, turnId, plan, session.accessToken);
         }
       }
     }
@@ -462,6 +508,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       queue: Promise.resolve(),
       signal,
       turnId,
+      spokenText: "",
     };
     let reply = "";
     /** Spoken after the streamed answer; never re-speaks what already went out. */
@@ -682,12 +729,16 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         synthetic: Boolean(opts.synthetic),
       });
 
-      live?.emit("transcript", assistantTranscript(turnId, reply, action));
       if (speech.dispatched > 0) {
+        speech.transcriptAction = action;
+        speech.transcriptFinal = true;
+        // Publish the full reply as soon as we have it so a late TTS failure
+        // cannot leave the UI stuck on a partial spoken prefix.
+        live?.emit("transcript", assistantTranscript(turnId, reply, action));
         if (tail) this.streamSay(live, session, speech, tail);
         await this.finishSpeech(live, session, speech);
       } else {
-        await this.speak(sessionId, reply, { turnId, signal });
+        await this.speak(sessionId, reply, { turnId, signal, action });
       }
     } catch (err) {
       this.log.warn(`turn ${err}`);
@@ -702,6 +753,120 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     } finally {
       // A turn that ends without ever emitting audio (TTS threw) would
       // otherwise leave the timer armed to speak over the next one.
+      if (live) this.clearFiller(live);
+    }
+  }
+
+  /**
+   * Ask AI Tutor voice: STT/TTS transport only.
+   * Same FastAPI student_assistant stream as the text modal — no chapter orchestrator.
+   */
+  private async runAssistantTurn(
+    sessionId: string,
+    utterance: string,
+    t0: number,
+    opts: { filler?: boolean; synthetic?: boolean },
+  ): Promise<void> {
+    const live = this.live.get(sessionId);
+    const session = await this.memory.get(sessionId);
+    if (!session || !session.agentMode) return;
+
+    const history = session.recentMessages;
+    const signal = live?.abort.signal;
+    let turnId = 0;
+    if (live) {
+      turnId = ++live.turnId;
+      live.answerAudioStarted = false;
+      live.turnStartedAt = t0;
+      live.turnUtterance = opts.synthetic ? "" : utterance;
+      if (!opts.synthetic) {
+        live.emit("transcript", userTranscriptPending(turnId, utterance));
+      }
+      if (opts.filler !== false) {
+        const plan = resolveFillerPlan({
+          utterance,
+          action: "ANSWER",
+          followup: "none",
+          quizPending: false,
+          currentConcept: session.currentTopic,
+          chapter: session.scope.chapterNames[0] || session.scope.chapter || "",
+        });
+        if (!plan.skip) {
+          this.armFiller(live, turnId, plan, session.accessToken);
+        }
+      }
+    }
+
+    const speech: SpeechStream = {
+      dispatched: 0,
+      begun: false,
+      failed: false,
+      queue: Promise.resolve(),
+      signal,
+      turnId,
+      spokenText: "",
+    };
+
+    try {
+      const rag = await this.streamAssistant({
+        session,
+        live,
+        speech,
+        signal,
+        query: utterance,
+      });
+      let reply = rag.answer;
+      if (!reply) reply = MSG.didntCatch;
+
+      if (!turnStillActive(signal, turnId, live?.turnId)) {
+        await this.discardTurn(live, session, speech, turnId, opts);
+        return;
+      }
+
+      if (!opts.synthetic && live) {
+        live.emit("transcript", userTranscriptCommitted(turnId, utterance));
+      }
+
+      const turns: ChatTurn[] = opts.synthetic
+        ? [...history, { role: "assistant", content: reply }]
+        : [...history, { role: "user", content: utterance }, { role: "assistant", content: reply }];
+      session.recentMessages = turns;
+      if (!opts.synthetic) {
+        await this.progress.recordMessage(session.conversationId, "user", utterance);
+      }
+      await this.progress.recordMessage(session.conversationId, "assistant", reply);
+      await this.memory.save(session);
+
+      voiceLog("turn", {
+        sessionId,
+        conversationId: session.conversationId,
+        studentId: session.studentId,
+        subject: session.agentMode || "assistant",
+        ragMs: rag.ms,
+        totalMs: Date.now() - t0,
+        streamed: speech.dispatched > 0,
+        synthetic: Boolean(opts.synthetic),
+      });
+
+      if (speech.dispatched > 0) {
+        speech.transcriptAction = "ANSWER";
+        speech.transcriptFinal = true;
+        live?.emit("transcript", assistantTranscript(turnId, reply, "ANSWER"));
+        await this.finishSpeech(live, session, speech);
+      } else {
+        await this.speak(sessionId, reply, { turnId, signal, action: "ANSWER" });
+      }
+    } catch (err) {
+      this.log.warn(`assistant turn ${err}`);
+      if (signal?.aborted) {
+        await this.discardTurn(live, session, speech, turnId, opts);
+        return;
+      }
+      session.state = "ERROR";
+      await this.memory.save(session);
+      live?.emit("voice_error", { message: MSG.llmFail });
+      await this.speak(sessionId, MSG.llmFail);
+    } finally {
       if (live) this.clearFiller(live);
     }
   }
@@ -753,10 +918,12 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
   private clearFiller(live: Live): void {
     if (live.fillerTimer) clearTimeout(live.fillerTimer);
     live.fillerTimer = null;
+    live.fillerPending = null;
+    live.fillerPlan = null;
     live.fillerEndsAt = 0;
   }
 
-  private armFiller(live: Live, turnId: number, intent: FillerIntent, utterance: string): void {
+  private armFiller(live: Live, turnId: number, plan: FillerPlan, accessToken: string): void {
     if (!config.thinkingFiller) return;
     this.clearFiller(live);
     if (!live.fillerCohort) return;
@@ -764,9 +931,12 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       voiceLog("filler_skipped", { sessionId: live.sessionId, fillerReason: "session_fast" });
       return;
     }
+    live.fillerPlan = plan;
+    // Start LLM+TTS now so the clip is ready when the delay fires.
+    live.fillerPending = this.filler.prepare(live.sessionId, plan, accessToken);
     live.fillerTimer = setTimeout(() => {
       live.fillerTimer = null;
-      this.playFiller(live, turnId, intent, utterance);
+      void this.playFiller(live, turnId);
     }, config.fillerDelayMs);
   }
 
@@ -774,22 +944,36 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
    * Best-effort only. Every exit logs why and returns; a filler that cannot
    * play must never disturb the turn that is still producing the real answer.
    */
-  private playFiller(live: Live, turnId: number, intent: FillerIntent, utterance: string): void {
+  private async playFiller(live: Live, turnId: number): Promise<void> {
     const sessionId = live.sessionId;
+    const plan = live.fillerPlan;
     try {
       if (live.turnId !== turnId || live.abort.signal.aborted) return;
       if (live.answerAudioStarted) {
         voiceLog("filler_skipped", { sessionId, fillerReason: "fast_response" });
         return;
       }
-      if (!live.emitPcm) return;
-      const clip = this.filler.take(sessionId, intent, utterance);
-      if (!clip) {
-        voiceLog("filler_skipped", { sessionId, fillerReason: "no_clip" });
+      if (!live.emitPcm || !plan) return;
+
+      const prepared = await (live.fillerPending ?? Promise.resolve(null));
+      if (live.turnId !== turnId || live.answerAudioStarted || live.abort.signal.aborted) {
+        voiceLog("filler_skipped", { sessionId, fillerReason: "fast_response" });
         return;
       }
-      // Re-check: take() is sync, but the answer may have landed while the
-      // timer sat in the queue.
+
+      let clip = prepared?.clip ?? null;
+      let intent: FillerIntent = prepared?.intent ?? plan.intent;
+      if (!clip) {
+        const fallback = this.filler.take(sessionId, plan.intent, plan.utterance);
+        if (!fallback) {
+          voiceLog("filler_skipped", { sessionId, fillerReason: "no_clip" });
+          return;
+        }
+        clip = fallback;
+      } else {
+        this.filler.markUsed(sessionId, intent, prepared?.index ?? -1);
+      }
+
       if (live.turnId !== turnId || live.answerAudioStarted) return;
 
       live.fillerEndsAt = Date.now() + clip.durationMs;
@@ -839,6 +1023,72 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
    * Falls back to the buffered path whenever streaming is off or there is no
    * audio transport, so the returned shape is identical either way.
    */
+  private async streamAssistant(opts: {
+    session: VoiceSession;
+    live?: Live;
+    speech: SpeechStream;
+    signal?: AbortSignal;
+    query: string;
+  }): Promise<RagResult> {
+    const { session, live, speech, signal, query } = opts;
+    const history: ChatTurn[] = session.recentMessages;
+    const ask = {
+      token: session.accessToken,
+      query,
+      agentMode: session.agentMode || "free",
+      history,
+      signal,
+    };
+
+    if (!this.streaming(live)) {
+      return this.safeAssistant(ask, live);
+    }
+
+    const committed = speech.dispatched > 0;
+    let spoken = 0;
+    try {
+      const result = await this.rag.askAssistantStream(ask, {
+        onSentence: (sentence) => {
+          spoken += 1;
+          this.streamSay(live, session, speech, sentence);
+        },
+      });
+      if (committed && spoken === 0 && result.answer) {
+        this.streamSay(live, session, speech, result.answer);
+      }
+      return result;
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      if (err instanceof RagAuthError) {
+        this.log.warn("assistant stream auth expired");
+        this.emitAuthExpired(live);
+        if (committed) this.streamSay(live, session, speech, MSG.authExpired);
+        return { answer: MSG.authExpired, retrievedIds: [], pages: [], images: [], ms: 0 };
+      }
+      this.log.warn(`assistant stream ${err}`);
+      if (committed) this.streamSay(live, session, speech, MSG.ragFail);
+      return { answer: MSG.ragFail, retrievedIds: [], pages: [], images: [], ms: 0 };
+    }
+  }
+
+  private async safeAssistant(
+    ask: Parameters<RagClient["askAssistantStream"]>[0],
+    live?: Live,
+  ): Promise<RagResult> {
+    try {
+      return await this.rag.askAssistantStream(ask, {});
+    } catch (err) {
+      if (ask.signal?.aborted) throw err;
+      if (err instanceof RagAuthError) {
+        this.log.warn("assistant auth expired");
+        this.emitAuthExpired(live);
+        return { answer: MSG.authExpired, retrievedIds: [], pages: [], images: [], ms: 0 };
+      }
+      this.log.warn(`assistant ${err}`);
+      return { answer: MSG.ragFail, retrievedIds: [], pages: [], images: [], ms: 0 };
+    }
+  }
+
   private async streamRag(opts: {
     session: VoiceSession;
     live?: Live;
@@ -965,7 +1215,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
           speech.begun = true;
           await this.beginSpeech(live, session, speech.turnId);
         }
-        await this.speakChunk(live, session, chunk, speech.signal, speech.turnId);
+        await this.speakChunk(live, session, chunk, speech.signal, speech.turnId, speech);
       })
       .catch((err) => {
         speech.failed = true;
@@ -999,6 +1249,11 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     session.state = "SPEAKING";
     live.speaking = true;
     await this.memory.save(session);
+    // Lock in the student line the moment we start speaking — otherwise the
+    // client would reject assistant text while user.pending is still true.
+    if (turnId > 0 && live.turnUtterance) {
+      live.emit("transcript", userTranscriptCommitted(turnId, live.turnUtterance));
+    }
     live.emit("ai_started_speaking");
   }
 
@@ -1009,6 +1264,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     chunk: string,
     signal?: AbortSignal,
     turnId = 0,
+    speech?: SpeechStream,
   ): Promise<boolean> {
     const cancelled = (): boolean =>
       !turnStillActive(signal, turnId, live.turnId) || live.abort.signal.aborted;
@@ -1046,6 +1302,14 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     // TURN server is configured, so WS is the one that works behind NAT.
     // Move to the datachannel only if you also drop the WS binary path.
     live.emitPcm?.(packed);
+    // Mirror spoken text with the audio so the transcript keeps pace.
+    if (turnId > 0 && speech && !speech.transcriptFinal) {
+      speech.spokenText = speech.spokenText ? `${speech.spokenText} ${say}` : say;
+      live.emit(
+        "transcript",
+        assistantTranscript(turnId, speech.spokenText, speech.transcriptAction),
+      );
+    }
     return true;
   }
 
@@ -1066,18 +1330,34 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
   private async speak(
     sessionId: string,
     text: string,
-    opts: { turnId?: number; signal?: AbortSignal } = {},
+    opts: { turnId?: number; signal?: AbortSignal; action?: string } = {},
   ): Promise<void> {
     const live = this.live.get(sessionId);
     const session = await this.memory.get(sessionId);
     if (!live || !session) return;
     const turnId = opts.turnId ?? 0;
     if (!turnStillActive(opts.signal, turnId, live.turnId)) return;
+    const speech: SpeechStream = {
+      dispatched: 0,
+      begun: false,
+      failed: false,
+      queue: Promise.resolve(),
+      signal: opts.signal,
+      turnId,
+      spokenText: "",
+      transcriptAction: opts.action,
+    };
     await this.beginSpeech(live, session, turnId);
+    speech.begun = true;
+    // Full reply is already known on the buffered path — show it with first audio.
+    if (turnId > 0 && text.trim()) {
+      speech.transcriptFinal = true;
+      live.emit("transcript", assistantTranscript(turnId, text, opts.action));
+    }
     const t0 = Date.now();
     try {
       for (const chunk of splitSentences(text)) {
-        if (!(await this.speakChunk(live, session, chunk, opts.signal, turnId))) break;
+        if (!(await this.speakChunk(live, session, chunk, opts.signal, turnId, speech))) break;
       }
       voiceLog("tts", { sessionId, ttsMs: Date.now() - t0 });
     } catch (err) {

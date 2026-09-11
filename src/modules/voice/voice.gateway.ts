@@ -9,11 +9,38 @@ import type { WebSocket } from "ws";
 import { verifyAccessToken } from "../../common/jwt";
 import { MSG } from "../../common/messages";
 import { iceServers } from "../../config";
-import { ConversationMemoryService } from "../conversation/conversation-memory.service";
+import {
+  AssistantAgentMode,
+  ConversationMemoryService,
+} from "../conversation/conversation-memory.service";
+import type { ChatTurn } from "../tutor/interfaces";
 import { VoiceService } from "./voice.service";
 import { WebrtcService } from "./webrtc.service";
 
 type Client = WebSocket & { sessionId?: string; studentId?: string; greetText?: string };
+
+function normalizeAgentMode(raw: unknown): AssistantAgentMode | undefined {
+  const m = String(raw || "")
+    .trim()
+    .toLowerCase();
+  if (m === "free" || m === "ask" || m === "practice" || m === "explain") return m;
+  return undefined;
+}
+
+function parseConversationHistory(raw: unknown): ChatTurn[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ChatTurn[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    const role = String(row.role || "");
+    const content = String(row.content || "").trim();
+    if ((role === "user" || role === "assistant") && content) {
+      out.push({ role, content });
+    }
+  }
+  return out.slice(-14);
+}
 
 @WebSocketGateway({ path: "/rtc/voice" })
 export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
@@ -28,11 +55,22 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
   handleConnection(client: Client, req: IncomingMessage): void {
     client.on("message", (raw, isBinary) => {
       if (isBinary) {
-        const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as ArrayBuffer);
-        if (client.sessionId && buf.length > 0) this.voice.onPcm(client.sessionId, buf);
+        // Trust the ws isBinary flag — text JSON also arrives as Buffer.
+        const buf = Buffer.isBuffer(raw)
+          ? raw
+          : raw instanceof ArrayBuffer
+            ? Buffer.from(raw)
+            : ArrayBuffer.isView(raw)
+              ? Buffer.from(
+                  (raw as ArrayBufferView).buffer,
+                  (raw as ArrayBufferView).byteOffset,
+                  (raw as ArrayBufferView).byteLength,
+                )
+              : null;
+        if (client.sessionId && buf && buf.length > 0) this.voice.onPcm(client.sessionId, buf);
         return;
       }
-      void this.onMessage(client, String(raw));
+      void this.onMessage(client, Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw));
     });
     try {
       const host = req.headers.host || "localhost";
@@ -148,6 +186,8 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
   private async startCall(client: Client, msg: Record<string, unknown>): Promise<void> {
     const token = String(msg.token || "");
     const user = verifyAccessToken(token);
+    const agentMode = normalizeAgentMode(msg.agentMode ?? msg.agent_mode);
+    const history = parseConversationHistory(msg.conversationHistory ?? msg.conversation_history);
     const session = await this.voice.create({
       studentId: user.studentId,
       token,
@@ -159,6 +199,8 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
         chapterNames: Array.isArray(msg.chapterNames) ? msg.chapterNames.map(String) : [],
         chapter: msg.chapter ? String(msg.chapter) : undefined,
       },
+      agentMode,
+      conversationHistory: history,
     });
     client.sessionId = session.id;
     const attached = await this.wireTransport(client, session.id);
@@ -169,7 +211,9 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
       });
       return;
     }
-    this.log.log(`session ready id=${session.id} student=${user.studentId}`);
+    this.log.log(
+      `session ready id=${session.id} student=${user.studentId}${agentMode ? ` agentMode=${agentMode}` : ""}`,
+    );
     const greet = String(msg.greet || "") === "1";
     this.send(client, "session_ready", {
       sessionId: session.id,
@@ -178,11 +222,16 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
       resumed: false,
     });
     if (greet) {
-      void this.voice.handleText(
-        session.id,
-        "Greet me briefly and ask what I would like to learn today. Do not start teaching yet.",
-        { filler: false, synthetic: true },
-      );
+      if (agentMode) {
+        // Fixed TTS only — does not call student_assistant (keeps Ask AI answers unchanged).
+        void this.voice.speakAssistantGreeting(session.id);
+      } else {
+        void this.voice.handleText(
+          session.id,
+          "Greet me briefly and ask what I would like to learn today. Do not start teaching yet.",
+          { filler: false, synthetic: true },
+        );
+      }
     }
   }
 

@@ -120,3 +120,45 @@ describe("RagClient askStream", () => {
     assert.equal(result.images[1].figure_number, "2.12");
   });
 });
+
+describe("RagClient askAssistantStream", () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  it("POSTs student_assistant URL with agent_mode and history only", async () => {
+    let seenUrl = "";
+    let seenBody: Record<string, unknown> = {};
+    global.fetch = async (input, init) => {
+      seenUrl = String(input);
+      seenBody = JSON.parse(String(init?.body || "{}")) as Record<string, unknown>;
+      return ndjsonResponse([
+        { type: "token", content: "Same Ask AI answer." },
+        { type: "done" },
+      ]);
+    };
+
+    const client = new RagClient();
+    const sentences: string[] = [];
+    const result = await client.askAssistantStream(
+      {
+        token: "tok",
+        query: "What is photosynthesis?",
+        agentMode: "free",
+        history: [{ role: "user", content: "hi" }, { role: "assistant", content: "hello" }],
+      },
+      { onSentence: (s) => sentences.push(s) },
+    );
+
+    assert.match(seenUrl, /\/auth\/student\/assistant\/chat\/stream$/);
+    assert.equal(seenBody.agent_mode, "free");
+    assert.equal(seenBody.query, "What is photosynthesis?");
+    assert.equal(seenBody.voice_mode, undefined);
+    assert.equal(seenBody.board, undefined);
+    assert.ok(Array.isArray(seenBody.conversation_history));
+    assert.match(result.answer, /Same Ask AI answer/);
+    assert.ok(sentences.length >= 1);
+  });
+});

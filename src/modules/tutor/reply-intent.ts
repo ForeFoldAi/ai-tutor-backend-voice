@@ -31,9 +31,20 @@ const ACK_EDU_RE =
 const EXAMPLE_PRAISE_RE =
   /^(?:(?:ok|okay|yes|yeah|yep|sure)\s+)?(?:a\s+)?(?:nice|good|great|cool|lovely)\s+example(?:\s+(?:thanks|thank\s+you))?$/i;
 
+/**
+ * Student understood / liked the explanation — real classroom reactions.
+ * Keep short (≤16 words) so "good explanation of cells, now what is…" stays a question.
+ */
+const UNDERSTANDING_PRAISE_RE =
+  /\b(?:(?:really\s+|very\s+|so\s+)?(?:good|great|nice|clear|helpful|excellent|awesome|wonderful|perfect)\s+(?:explanation|example|teaching|job|one)|well\s+explained|explained\s+(?:it\s+)?well|(?:i\s+)?(?:really\s+)?(?:understood?|got\s+it|understand)(?:\s+(?:it|that|this|everything))?(?:\s+(?:very\s+well|clearly|now|fully|better))?|(?:it\s+)?(?:was\s+|is\s+)?(?:very\s+|really\s+)?(?:clear|helpful)(?:\s+(?:for\s+me|to\s+me))?|makes\s+(?:perfect\s+|more\s+)?sense|that\s+helped(?:\s+(?:a\s+lot|me|a\s+ton))?|crystal\s+clear|now\s+i\s+(?:get|understand)\s+it|i\s+get\s+it\s+now)\b/i;
+
 /** Self-intro — not a curriculum topic. */
 const PERSONAL_INTRO_RE =
   /^(?:(?:hi|hello|hey)[,!]?\s+)?(?:i(?:'m|\s+am)|my\s+name\s+is|this\s+is)\s+/i;
+
+/** Greeting-only — no teaching ask yet. */
+export const GREETING_ONLY_RE =
+  /^(?:hi|hello|hey|good\s+morning|good\s+afternoon|good\s+evening)(?:\s+(?:there|teacher|sir|madam|ma'?am))?[.!]*$/i;
 
 function ackNorm(text: string): string {
   return (text || "")
@@ -43,13 +54,27 @@ function ackNorm(text: string): string {
     .trim();
 }
 
-/** Bare laugh / okay / wow — not a question and not a quiz answer. */
+/** "Good explanation", "I understood very well", etc. — reaction, not a topic ask. */
+export function isUnderstandingPraise(utterance: string): boolean {
+  const q = ackNorm(utterance);
+  if (!q) return false;
+  if (ACK_EDU_RE.test(q)) return false;
+  if (q.split(/\s+/).length > 16) return false;
+  return UNDERSTANDING_PRAISE_RE.test(q);
+}
+
+/** Bare laugh / okay / wow / praise — not a question and not a quiz answer. */
 export function isBareAcknowledgement(utterance: string): boolean {
   const q = ackNorm(utterance);
   if (!q) return false;
   if (EXAMPLE_PRAISE_RE.test(q)) return true;
+  if (isUnderstandingPraise(q)) return true;
   if (ACK_EDU_RE.test(q)) return false;
   return ACK_RE.test(q);
+}
+
+export function isGreetingOnly(utterance: string): boolean {
+  return GREETING_ONLY_RE.test(ackNorm(utterance));
 }
 
 export function isPersonalIntro(utterance: string): boolean {

@@ -4,12 +4,17 @@ import { config } from "../../config";
 import { ChatTurn, FastApiTutorState, SessionScope, TutorSnapshot, VoiceState } from "../tutor/interfaces";
 import { defaultSnapshot } from "../tutor/tutor-state.service";
 
+/** Ask AI Tutor modes — when set, Nest routes turns to student_assistant (not chapter RAG). */
+export type AssistantAgentMode = "free" | "ask" | "practice" | "explain";
+
 export type VoiceSession = {
   id: string;
   conversationId: string;
   studentId: string;
   accessToken: string;
   scope: SessionScope;
+  /** When set, voice is transport-only for Ask AI Tutor. */
+  agentMode?: AssistantAgentMode;
   state: VoiceState;
   tutor: TutorSnapshot;
   recentMessages: ChatTurn[];
@@ -80,6 +85,7 @@ export class ConversationMemoryService implements OnModuleDestroy {
       session.quizAttempts = session.quizAttempts ?? 0;
       session.lastQuizQuestion = session.lastQuizQuestion ?? "";
       session.lastFillerPhrase = session.lastFillerPhrase ?? "";
+      // agentMode may be absent on older Redis snapshots — leave undefined
       this.mem.set(id, session);
       this.redisFailures = 0;
       return session;

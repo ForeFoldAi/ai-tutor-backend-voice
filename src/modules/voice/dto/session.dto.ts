@@ -1,12 +1,21 @@
-import { IsArray, IsOptional, IsString } from "class-validator";
+import { IsArray, IsOptional, IsString, ValidateIf } from "class-validator";
 
 export class StartSessionDto {
-  @IsString() board!: string;
-  @IsString() classLevel!: string;
-  @IsString() subject!: string;
+  /** Required for chapter voice; optional when agentMode is set (Ask AI Tutor). */
+  @ValidateIf((o: StartSessionDto) => !o.agentMode)
+  @IsString()
+  board!: string;
+  @ValidateIf((o: StartSessionDto) => !o.agentMode)
+  @IsString()
+  classLevel!: string;
+  @ValidateIf((o: StartSessionDto) => !o.agentMode)
+  @IsString()
+  subject!: string;
   @IsOptional() @IsArray() @IsString({ each: true }) chapterIds?: string[];
   @IsOptional() @IsArray() @IsString({ each: true }) chapterNames?: string[];
   @IsOptional() @IsString() chapter?: string;
+  /** Ask AI Tutor: free | ask | practice | explain */
+  @IsOptional() @IsString() agentMode?: string;
 }
 
 export class EvaluateDto {
