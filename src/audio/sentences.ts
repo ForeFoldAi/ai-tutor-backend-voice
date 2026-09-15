@@ -38,10 +38,16 @@ export function speakable(text: string): string {
       .replace(/_\{?(\d+)\}?/g, " sub $1")
       .replace(/^\s{0,3}#{1,6}\s+/gm, "")
       .replace(/^\s*(?:[-*+•]|\d+[.)])\s+/gm, "")
+      // Drop HR / table-rule lines before whitespace collapse — otherwise
+      // `---` becomes an inline "dash dash dash" for Edge TTS.
+      .replace(/^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/gm, " ")
+      .replace(/^\s*[-*_]{3,}\s*$/gm, " ")
       .replace(/\(\s*(?:see\s+)?(?:Fig|Figure|Table|Page|p)\.?\s*[\d.]+\s*\)/gi, " ")
       // Left over after the structural passes above: emphasis, blockquote and
       // table markers that only ever appear as markup, never as speech.
       .replace(/[*_~>|#{}\\]/g, "")
+      // Safety net for HR fragments that survived mid-line (e.g. after | strip).
+      .replace(/(?:^|\s)-{3,}(?=\s|$)/g, " ")
       .replace(/\s+([,.;:!?])/g, "$1")
       .replace(/\s+/g, " ")
       .trim()

@@ -109,4 +109,15 @@ describe("speakable", () => {
     assert.equal(speakable("***"), "");
     assert.equal(speakable("   "), "");
   });
+
+  it("does not speak markdown headings or horizontal rules as dashes", () => {
+    assert.equal(speakable("### Examples from your textbook:"), "Examples from your textbook:");
+    assert.equal(speakable("Intro\n---\nBody text here."), "Intro Body text here.");
+    assert.equal(
+      speakable("### Heading\n- bullet\n---\nMore"),
+      "Heading bullet More",
+    );
+    const out = speakable("| --- | --- |");
+    assert.ok(!/-{2,}/.test(out), `table rule survived: ${JSON.stringify(out)}`);
+  });
 });
