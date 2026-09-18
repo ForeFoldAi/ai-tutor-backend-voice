@@ -318,6 +318,8 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       live.chunks = [];
       if (Date.now() - live.lastSpokeAt < config.sttPostPlaybackMs) {
         live.vad.reset();
+        // Client left PROCESSING after student_stopped — release it; no LLM turn.
+        live.emit("ai_stopped_processing");
         return;
       }
       void this.enqueueTurn(live.sessionId, () => this.handleUtterance(live.sessionId, merged));
@@ -389,9 +391,13 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
   private async handleUtterance(sessionId: string, pcm: Int16Array): Promise<void> {
     const live = this.live.get(sessionId);
     const t0 = Date.now();
-    live?.emit("ai_started_processing");
+    // Don't emit ai_started_processing here — that marks "Composing" on the client.
+    // Wait until runTurn (real LLM) so noise/empty STT never shows composing.
     const session = await this.memory.get(sessionId);
-    if (!session) return;
+    if (!session) {
+      live?.emit("ai_stopped_processing");
+      return;
+    }
     session.state = "PROCESSING";
     await this.memory.save(session);
 
