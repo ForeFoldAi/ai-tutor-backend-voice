@@ -154,7 +154,11 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
         return;
       }
       if (type === "text") {
-        await this.voice.handleText(sessionId, String(msg.text || ""));
+        const rawIds = msg.image_ids ?? msg.imageIds;
+        const imageIds = Array.isArray(rawIds)
+          ? rawIds.map((x) => String(x || "").trim()).filter(Boolean)
+          : undefined;
+        await this.voice.handleText(sessionId, String(msg.text || ""), { imageIds });
         return;
       }
       if (type === "session_end") {

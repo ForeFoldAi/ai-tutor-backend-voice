@@ -329,7 +329,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
   async handleText(
     sessionId: string,
     text: string,
-    opts: { filler?: boolean; synthetic?: boolean } = {},
+    opts: { filler?: boolean; synthetic?: boolean; imageIds?: string[] } = {},
   ): Promise<void> {
     await this.enqueueTurn(sessionId, () => this.runTurn(sessionId, text, Date.now(), opts));
   }
@@ -449,7 +449,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     sessionId: string,
     utterance: string,
     t0 = Date.now(),
-    opts: { filler?: boolean; synthetic?: boolean } = {},
+    opts: { filler?: boolean; synthetic?: boolean; imageIds?: string[] } = {},
   ): Promise<void> {
     const live = this.live.get(sessionId);
     const session = await this.memory.get(sessionId);
@@ -552,6 +552,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
           guardNotFound: false,
           followup: "none",
           dialogueAct,
+          imageIds: opts.imageIds,
         });
         ragMs = rag.ms;
         retrievedIds = rag.retrievedIds;
@@ -611,6 +612,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
           query: utterance,
           guardNotFound: false,
           followup: ragFollowup,
+          imageIds: opts.imageIds,
         });
         ragMs = rag.ms;
         retrievedIds = rag.retrievedIds;
@@ -635,6 +637,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
           query: utterance,
           guardNotFound: true,
           followup: ragFollowup,
+          imageIds: opts.imageIds,
         });
         ragMs = rag.ms;
         retrievedIds = rag.retrievedIds;
@@ -771,7 +774,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     sessionId: string,
     utterance: string,
     t0: number,
-    opts: { filler?: boolean; synthetic?: boolean },
+    opts: { filler?: boolean; synthetic?: boolean; imageIds?: string[] },
   ): Promise<void> {
     const live = this.live.get(sessionId);
     const session = await this.memory.get(sessionId);
@@ -820,6 +823,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         speech,
         signal,
         query: utterance,
+        imageIds: opts.imageIds,
       });
       let reply = rag.answer;
       if (!reply) reply = MSG.didntCatch;
@@ -1035,8 +1039,9 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     speech: SpeechStream;
     signal?: AbortSignal;
     query: string;
+    imageIds?: string[];
   }): Promise<RagResult> {
-    const { session, live, speech, signal, query } = opts;
+    const { session, live, speech, signal, query, imageIds } = opts;
     const history: ChatTurn[] = session.recentMessages;
     const ask = {
       token: session.accessToken,
@@ -1044,6 +1049,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       agentMode: session.agentMode || "free",
       history,
       signal,
+      imageIds,
     };
 
     if (!this.streaming(live)) {
@@ -1103,6 +1109,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     query: string;
     followup?: string;
     dialogueAct?: DialogueAct;
+    imageIds?: string[];
     /**
      * True on the plain-question path, where an answer of "I couldn't find
      * this in your chapter" gets swapped for MSG.notInTextbook afterwards.
@@ -1111,7 +1118,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
      */
     guardNotFound: boolean;
   }): Promise<RagResult> {
-    const { session, live, speech, signal, query, followup = "none", dialogueAct } = opts;
+    const { session, live, speech, signal, query, followup = "none", dialogueAct, imageIds } = opts;
     const history: ChatTurn[] = session.summary
       ? [{ role: "assistant", content: session.summary }, ...session.recentMessages]
       : session.recentMessages;
@@ -1130,6 +1137,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       dialogueAct,
       fillerPhrasePlayed: live?.lastFillerPhrase || session.lastFillerPhrase,
       affectTrajectory: session.affectTrajectory,
+      imageIds,
     };
 
     if (!this.streaming(live)) {

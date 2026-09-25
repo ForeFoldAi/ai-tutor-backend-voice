@@ -90,6 +90,17 @@ describe("RagClient askStream", () => {
     assert.deepEqual(result.pages, [14, 22]);
   });
 
+  it("forwards image_ids on the chapter stream body when provided", async () => {
+    let posted: unknown;
+    global.fetch = async (_url, init) => {
+      posted = JSON.parse(String(init?.body || "{}"));
+      return ndjsonResponse([{ type: "token", content: "ok" }, { type: "done" }]);
+    };
+    const client = new RagClient();
+    await client.askStream({ ...ASK_OPTS, imageIds: ["abc123"] }, {});
+    assert.deepEqual((posted as { image_ids?: string[] }).image_ids, ["abc123"]);
+  });
+
   it("replaces images when a later related_images event arrives", async () => {
     const early = [
       { url: "/auth/catalog/u/a.png", caption: "early", page: 1, figure_number: "2.3" },

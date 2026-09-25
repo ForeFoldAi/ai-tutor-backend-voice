@@ -28,6 +28,8 @@ export type RagAskOptions = {
   dialogueAct?: string;
   fillerPhrasePlayed?: string;
   affectTrajectory?: string[];
+  /** Ephemeral student upload ids from POST /auth/tutor/images */
+  imageIds?: string[];
 };
 
 export type AssistantAskOptions = {
@@ -36,6 +38,7 @@ export type AssistantAskOptions = {
   agentMode: string;
   history: ChatTurn[];
   signal?: AbortSignal;
+  imageIds?: string[];
 };
 
 /** FastAPI rejected the bearer token (expired / wrong secret). */
@@ -137,6 +140,7 @@ export class RagClient {
     if (opts.dialogueAct) body.dialogue_act = opts.dialogueAct;
     if (opts.fillerPhrasePlayed) body.filler_phrase_played = opts.fillerPhrasePlayed;
     if (opts.affectTrajectory?.length) body.affect_trajectory = opts.affectTrajectory;
+    if (opts.imageIds?.length) body.image_ids = opts.imageIds;
 
     const res = await fetch(`${config.tutorApiUrl}/auth/chat/stream`, {
       method: "POST",
@@ -236,7 +240,7 @@ export class RagClient {
    */
   async askAssistantStream(opts: AssistantAskOptions, handlers: RagStreamHandlers): Promise<RagResult> {
     const started = Date.now();
-    const body = {
+    const body: Record<string, unknown> = {
       query: opts.query,
       conversation_history: opts.history.slice(-8).map((t) => ({
         role: t.role,
@@ -244,6 +248,7 @@ export class RagClient {
       })),
       agent_mode: opts.agentMode || "free",
     };
+    if (opts.imageIds?.length) body.image_ids = opts.imageIds;
 
     const res = await fetch(`${config.tutorApiUrl}/auth/student/assistant/chat/stream`, {
       method: "POST",
