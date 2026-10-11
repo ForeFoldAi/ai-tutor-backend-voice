@@ -112,12 +112,29 @@ describe("speakable", () => {
 
   it("does not speak markdown headings or horizontal rules as dashes", () => {
     assert.equal(speakable("### Examples from your textbook:"), "Examples from your textbook:");
-    assert.equal(speakable("Intro\n---\nBody text here."), "Intro Body text here.");
+    assert.equal(speakable("Intro\n---\nBody text here."), "Intro. Body text here.");
     assert.equal(
       speakable("### Heading\n- bullet\n---\nMore"),
-      "Heading bullet More",
+      "Heading. bullet. More",
     );
     const out = speakable("| --- | --- |");
     assert.ok(!/-{2,}/.test(out), `table rule survived: ${JSON.stringify(out)}`);
+  });
+});
+
+describe("step-by-step answers", () => {
+  const lcm =
+    "To find the LCM of 45 and 50, follow these steps:\n\n1. First, find the prime factors of each number.\n- 45 = 3 × 3 × 5 = 3² × 5\n- 50 = 2 × 5 × 5 = 2 × 5²\n\n2. Take the highest power of each prime number from both lists.\n- Highest power of 2: 2¹\n- Highest power of 3: 3²\n\n3. Multiply these together to get the LCM.\n- LCM = 2¹ × 3² × 5² = 450\n\nSo, the LCM of 45 and 50 is 450.";
+
+  it("pauses between list lines instead of running them together", () => {
+    const spoken = drip(lcm, new SentenceStream(40, 80)).map(speakable).join(" ");
+    assert.match(spoken, /3² × 5\. 50 = /);
+    assert.match(spoken, /2: 2¹\. Highest power of 3/);
+  });
+
+  it("never ends a chunk on a step number", () => {
+    for (const chunk of drip(lcm, new SentenceStream(40, 80))) {
+      assert.doesNotMatch(chunk, /(?:^|\n)\s*\d+\.$/, chunk);
+    }
   });
 });

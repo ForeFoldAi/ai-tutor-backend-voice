@@ -62,6 +62,10 @@ export const config = {
   sttMinSpeechRms: Number(env("STT_MIN_SPEECH_RMS", "0.008")) || 0.008,
   /** Ignore mic after tutor audio ends — speaker echo otherwise becomes a fake turn. */
   sttPostPlaybackMs: envInt("STT_POST_PLAYBACK_MS", 1000),
+  /** Silence that ends a student turn. 900ms cut kids off mid-question while they thought. */
+  vadHangMs: envInt("VAD_HANG_MS", 1500),
+  /** Speech resumed this soon after a turn ended, before any reply audio, joins that turn. */
+  vadMergeMs: envInt("VAD_MERGE_MS", 6000),
   /** kokoro (local, en-US/en-GB) | edge (Microsoft, has en-IN voices) */
   ttsProvider: env("TTS_PROVIDER", "kokoro").toLowerCase(),
   kokoroVoice: env("KOKORO_VOICE", "af_heart"),
