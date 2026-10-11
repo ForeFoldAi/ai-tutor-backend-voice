@@ -48,6 +48,9 @@ export function speakable(text: string): string {
       .replace(/[*_~>|#{}\\]/g, "")
       // Safety net for HR fragments that survived mid-line (e.g. after | strip).
       .replace(/(?:^|\s)-{3,}(?=\s|$)/g, " ")
+      // Each list line / step is its own thought — end it so TTS pauses instead
+      // of running "… 3² × 5" straight into "50 = …".
+      .replace(/([^\s.!?,;:])[ \t]*(?:\r?\n)+/g, "$1.\n")
       .replace(/\s+([,.;:!?])/g, "$1")
       .replace(/\s+/g, " ")
       .trim()
@@ -104,6 +107,8 @@ export class SentenceStream {
     let m: RegExpExecArray | null;
     while ((m = re.exec(this.buf)) !== null) {
       const end = m.index + 1;
+      // "2." opening a list line is a step number, not a sentence end.
+      if (/(?:^|\n)[ \t]*\d+$/.test(this.buf.slice(0, m.index))) continue;
       if (end >= min) return end;
     }
     if (this.buf.length >= this.max) {

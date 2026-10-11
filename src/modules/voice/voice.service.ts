@@ -4,7 +4,7 @@ import { MSG } from "../../common/messages";
 import { voiceLog } from "../../common/logger";
 import { floatToInt16, int16ToFloat, packPcm, PCM_SAMPLE_RATE, resample, unpackPcm } from "../../audio/pcm";
 import { SileroVad, loadSilero } from "../../audio/vad";
-import { speakable } from "../../audio/sentences";
+import { CHUNK_MIN_CHARS, SentenceStream, speakable } from "../../audio/sentences";
 import {
   AssistantAgentMode,
   ConversationMemoryService,
@@ -82,6 +82,11 @@ type Live = {
   turnQ: Promise<void>;
   /** Epoch ms the tutor last finished speaking (echo window). */
   lastSpokeAt: number;
+  /** Audio of the last dispatched utterance until reply audio starts; resumed speech merges into it. */
+  pendingPcm: Int16Array | null;
+  pendingAt: number;
+  /** Bumped per dispatched/merged utterance so a superseded one is dropped after STT. */
+  utterGen: number;
 };
 
 /**
@@ -221,7 +226,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     if (claim === "owned_elsewhere") return "owned_elsewhere";
     const live: Live = {
       sessionId,
-      vad: new SileroVad({ hangMs: 900 }),
+      vad: new SileroVad({ hangMs: config.vadHangMs }),
       chunks: [],
       abort: new AbortController(),
       emit,
@@ -242,6 +247,9 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       turnUtterance: "",
       turnQ: Promise.resolve(),
       lastSpokeAt: 0,
+      pendingPcm: null,
+      pendingAt: 0,
+      utterGen: 0,
     };
     this.live.set(sessionId, live);
     void this.memory.get(sessionId).then((s) => {
@@ -300,8 +308,31 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     const events = await live.vad.push(samples);
     const hadStart = events.includes("start");
     const hadStop = events.includes("stop");
+    // Turn ended and a new one began inside this frame: close the old one first,
+    // otherwise the reset below throws its audio away.
+    const restarted = hadStop && events.lastIndexOf("start") > events.lastIndexOf("stop");
+    if (restarted) {
+      live.chunks.push(samples);
+      this.endUtterance(live);
+    }
     if (hadStart) {
       live.chunks = [samples];
+      if (
+        live.pendingPcm &&
+        Date.now() - live.pendingAt < config.vadMergeMs &&
+        !live.speaking &&
+        !this.fillerAudible(live)
+      ) {
+        // Student was only pausing — drop the half-question turn and answer both halves as one.
+        live.chunks = [live.pendingPcm, samples];
+        live.pendingPcm = null;
+        live.utterGen += 1;
+        live.abort.abort();
+        live.abort = new AbortController();
+        live.turnId += 1;
+        this.clearFiller(live);
+        voiceLog("utterance_merged", { sessionId: live.sessionId });
+      }
       live.emit("student_started_speaking");
       // Filler audio is interruptible AI audio like any other — it does not set
       // `speaking`, so barge-in has to check it explicitly.
@@ -312,18 +343,23 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     } else if (live.chunks.length > 0 || events.includes("speech")) {
       live.chunks.push(samples);
     }
-    if (hadStop) {
-      live.emit("student_stopped_speaking");
-      const merged = concat(live.chunks);
-      live.chunks = [];
-      if (Date.now() - live.lastSpokeAt < config.sttPostPlaybackMs) {
-        live.vad.reset();
-        // Client left PROCESSING after student_stopped — release it; no LLM turn.
-        live.emit("ai_stopped_processing");
-        return;
-      }
-      void this.enqueueTurn(live.sessionId, () => this.handleUtterance(live.sessionId, merged));
+    if (hadStop && !restarted) this.endUtterance(live);
+  }
+
+  private endUtterance(live: Live): void {
+    live.emit("student_stopped_speaking");
+    const merged = concat(live.chunks);
+    live.chunks = [];
+    if (Date.now() - live.lastSpokeAt < config.sttPostPlaybackMs) {
+      live.vad.reset();
+      // Client left PROCESSING after student_stopped — release it; no LLM turn.
+      live.emit("ai_stopped_processing");
+      return;
     }
+    live.pendingPcm = merged;
+    live.pendingAt = Date.now();
+    const gen = ++live.utterGen;
+    void this.enqueueTurn(live.sessionId, () => this.handleUtterance(live.sessionId, merged, gen));
   }
 
   async handleText(
@@ -366,6 +402,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     live?.emit("student_started_speaking");
     if (live) {
       live.chunks = [];
+      live.pendingPcm = null;
       live.vad.reset();
       live.lastSpokeAt = Date.now();
     }
@@ -388,8 +425,10 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     await this.memory.drop(sessionId);
   }
 
-  private async handleUtterance(sessionId: string, pcm: Int16Array): Promise<void> {
+  private async handleUtterance(sessionId: string, pcm: Int16Array, gen = 0): Promise<void> {
     const live = this.live.get(sessionId);
+    const superseded = () => gen > 0 && !!live && live.utterGen !== gen;
+    if (superseded()) return;
     const t0 = Date.now();
     // Don't emit ai_started_processing here — that marks "Composing" on the client.
     // Wait until runTurn (real LLM) so noise/empty STT never shows composing.
@@ -415,10 +454,12 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       text = await this.stt.transcribe(f32, PCM_SAMPLE_RATE);
     } catch (err) {
       this.log.warn(`stt ${err}`);
+      if (superseded()) return;
       await this.speak(sessionId, MSG.sttFail);
       return;
     }
     voiceLog("stt", { sessionId, studentId: session.studentId, sttMs: Date.now() - t0 });
+    if (superseded()) return;
     text = postprocessTranscript(text, session.scope.subject);
     const lastAssistant = [...(session.recentMessages || [])]
       .reverse()
@@ -988,6 +1029,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
 
       live.fillerEndsAt = Date.now() + clip.durationMs;
       live.lastFillerPhrase = clip.phrase;
+      live.pendingPcm = null;
       // Reusing ai_started_speaking keeps the client unchanged: it mutes the
       // mic uplink (no echo into STT) and arms barge-in. No transcript event,
       // so the filler never appears as an assistant message.
@@ -1262,6 +1304,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     await this.awaitFillerHandoff(live);
     session.state = "SPEAKING";
     live.speaking = true;
+    live.pendingPcm = null;
     await this.memory.save(session);
     // Lock in the student line the moment we start speaking — otherwise the
     // client would reject assistant text while user.pending is still true.
@@ -1425,16 +1468,7 @@ function concat(parts: Int16Array[]): Int16Array {
 }
 
 function splitSentences(text: string): string[] {
-  const parts = text.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
-  const out: string[] = [];
-  let buf = "";
-  for (const p of parts) {
-    buf = buf ? `${buf} ${p}` : p;
-    if (buf.length >= 80) {
-      out.push(buf);
-      buf = "";
-    }
-  }
-  if (buf) out.push(buf);
+  const s = new SentenceStream(CHUNK_MIN_CHARS, CHUNK_MIN_CHARS);
+  const out = [...s.push(text), s.flush()].filter(Boolean);
   return out.length ? out : [text];
 }
