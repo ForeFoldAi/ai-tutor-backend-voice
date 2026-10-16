@@ -38,6 +38,20 @@ export function speakable(text: string): string {
       .replace(/_\{?(\d+)\}?/g, " sub $1")
       .replace(/^\s{0,3}#{1,6}\s+/gm, "")
       .replace(/^\s*(?:[-*+•]|\d+[.)])\s+/gm, "")
+      // Maths symbols Edge misreads: "(a – b)²" came out as "a b superscript 2", "550 – 1" as "550 to 1".
+      // After bullet stripping (a leading "- " is a list, not minus); superscripts last so "a² – 2ab" still
+      // sees the ² as a maths term. Minus only between maths terms, so a prose dash stays a pause.
+      .replace(/(\b\w*\d\w*|[²³¹)]|\b[a-zA-Z]\b)[ \t]*[–−][ \t]*(?=\d|\b[a-zA-Z]\b|\()/g, "$1 minus ")
+      .replace(/(\b\w*\d\w*|[²³¹)]|\b[a-zA-Z]\b)[ \t]+-[ \t]+(?=\d|\b[a-zA-Z]\b|\()/g, "$1 minus ")
+      .replace(/(?<=[\w²³¹)])[ \t]*\+[ \t]*(?=[\w(])/g, " plus ")
+      .replace(/[ \t]*[×✕][ \t]*/g, " times ")
+      .replace(/[ \t]*÷[ \t]*/g, " divided by ")
+      .replace(/[ \t]*=[ \t]*/g, " equals ")
+      .replace(/√[ \t]*/g, " square root of ")
+      .replace(/∛[ \t]*/g, " cube root of ")
+      .replace(/²/g, " squared")
+      .replace(/³/g, " cubed")
+      .replace(/¹/g, "")
       // Drop HR / table-rule lines before whitespace collapse — otherwise
       // `---` becomes an inline "dash dash dash" for Edge TTS.
       .replace(/^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/gm, " ")
