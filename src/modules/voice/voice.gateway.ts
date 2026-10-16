@@ -87,7 +87,7 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   handleDisconnect(client: Client): void {
-    if (client.sessionId) void this.voice.detach(client.sessionId);
+    if (client.sessionId) void this.voice.detach(client.sessionId, client);
   }
 
   private async onMessage(client: Client, raw: string): Promise<void> {
@@ -184,6 +184,7 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
         if (client.readyState !== 1) return;
         client.send(buf);
       },
+      client,
     );
   }
 

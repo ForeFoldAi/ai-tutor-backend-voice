@@ -21,6 +21,7 @@ export const MSG = {
   network: "We lost the connection. I'll listen again when you're back.",
   emptySpeech: "Sorry, I didn't catch that. Could you say it again?",
   timeout: "That took a bit too long. Let's try once more.",
+  sessionLost: "I lost track of our session. Tap Start Talking to continue.",
   /** Student reacted instead of answering — keep the open question alive. */
   questionStillOpen: "Take a shot at that question whenever you're ready.",
   correct: "Exactly — nice work!",

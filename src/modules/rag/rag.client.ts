@@ -57,7 +57,7 @@ export type RagStreamHandlers = {
    * streamed. Anything emitted through onSentence before this is stale.
    */
   onReplace?: (clean: string) => void;
-  /** Textbook figures ready for the voice UI (may fire more than once per turn). */
+  /** Cumulative textbook figures for this turn (fires again only when new ones arrive). */
   onRelatedImages?: (images: RagRelatedImage[]) => void;
 };
 
@@ -102,6 +102,12 @@ function normalizeRelatedImages(raw: unknown): RagRelatedImage[] {
   return out;
 }
 
+/** Later batches add figures; they never drop ones already shown. De-duplicated by URL. */
+export function mergeImages(prev: RagRelatedImage[], batch: RagRelatedImage[]): RagRelatedImage[] {
+  const seen = new Set(prev.map((i) => i.url));
+  return [...prev, ...batch.filter((i) => !seen.has(i.url) && seen.add(i.url))];
+}
+
 @Injectable()
 export class RagClient {
   private readonly log = new Logger(RagClient.name);
@@ -142,21 +148,6 @@ export class RagClient {
     if (opts.affectTrajectory?.length) body.affect_trajectory = opts.affectTrajectory;
     if (opts.imageIds?.length) body.image_ids = opts.imageIds;
 
-    const res = await fetch(`${config.tutorApiUrl}/auth/chat/stream`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${opts.token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-      signal: opts.signal,
-    });
-    if (!res.ok) {
-      this.log.warn(`rag http ${res.status}`);
-      if (res.status === 401 || res.status === 403) throw new RagAuthError();
-      throw new Error("rag failed");
-    }
-
     let answer = "";
     const retrievedIds: string[] = [];
     const pages: number[] = [];
@@ -184,9 +175,10 @@ export class RagClient {
       }
       if (ev.type === "related_images") {
         const batch = normalizeRelatedImages(ev.images);
-        if (batch.length) {
-          images = batch;
-          handlers.onRelatedImages?.(batch);
+        const merged = mergeImages(images, batch);
+        if (merged.length > images.length) {
+          images = merged;
+          handlers.onRelatedImages?.(images);
         }
         for (const img of batch) {
           const id = img.textbook_upload_id && img.file_name ? `${img.textbook_upload_id}/${img.file_name}` : "";
@@ -206,13 +198,64 @@ export class RagClient {
       }
     };
 
-    const reader = res.body?.getReader();
-    if (reader) {
+    await this.streamNdjson("rag", "/auth/chat/stream", opts.token, body, opts.signal, onLine);
+
+    if (handlers.onSentence) {
+      const rest = sentences.flush();
+      if (rest) handlers.onSentence(rest);
+    }
+    return { answer: answer.trim(), retrievedIds, pages, images, ms: Date.now() - started, voiceMeta };
+  }
+
+  /**
+   * POST and feed each NDJSON line to `onLine`. Bounded twice: the response must
+   * start within ragFirstByteTimeoutMs and then never stall longer than
+   * ragIdleTimeoutMs, otherwise a hung FastAPI blocks the session's turn queue.
+   * A timeout rejects without aborting `signal`, so callers treat it as a
+   * failure to apologise for, not a barge-in to discard.
+   */
+  private async streamNdjson(
+    label: string,
+    path: string,
+    token: string,
+    body: unknown,
+    signal: AbortSignal | undefined,
+    onLine: (line: string) => void,
+  ): Promise<void> {
+    const ctl = new AbortController();
+    const onAbort = () => ctl.abort(signal?.reason);
+    if (signal?.aborted) onAbort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    let timer = setTimeout(() => ctl.abort(new Error(`${label} timeout`)), config.ragFirstByteTimeoutMs);
+    const bump = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => ctl.abort(new Error(`${label} stalled`)), config.ragIdleTimeoutMs);
+    };
+    try {
+      const res = await fetch(`${config.tutorApiUrl}${path}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: ctl.signal,
+      });
+      if (!res.ok) {
+        this.log.warn(`${label} http ${res.status}`);
+        if (res.status === 401 || res.status === 403) throw new RagAuthError();
+        throw new Error(`${label} failed`);
+      }
+      bump();
+      const reader = res.body?.getReader();
+      if (!reader) {
+        // No readable body (undici fallback): behave exactly as the old client.
+        for (const line of (await res.text()).split("\n")) onLine(line);
+        return;
+      }
       const decoder = new TextDecoder();
       let pending = "";
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
+        bump();
         pending += decoder.decode(value, { stream: true });
         let nl = pending.indexOf("\n");
         while (nl >= 0) {
@@ -222,16 +265,10 @@ export class RagClient {
         }
       }
       onLine(pending);
-    } else {
-      // No readable body (undici fallback): behave exactly as the old client.
-      for (const line of (await res.text()).split("\n")) onLine(line);
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
     }
-
-    if (handlers.onSentence) {
-      const rest = sentences.flush();
-      if (rest) handlers.onSentence(rest);
-    }
-    return { answer: answer.trim(), retrievedIds, pages, images, ms: Date.now() - started, voiceMeta };
   }
 
   /**
@@ -249,21 +286,6 @@ export class RagClient {
       agent_mode: opts.agentMode || "free",
     };
     if (opts.imageIds?.length) body.image_ids = opts.imageIds;
-
-    const res = await fetch(`${config.tutorApiUrl}/auth/student/assistant/chat/stream`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${opts.token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-      signal: opts.signal,
-    });
-    if (!res.ok) {
-      this.log.warn(`assistant http ${res.status}`);
-      if (res.status === 401 || res.status === 403) throw new RagAuthError();
-      throw new Error("assistant failed");
-    }
 
     let answer = "";
     const sentences = new SentenceStream(config.streamFirstChunkChars, config.streamChunkChars);
@@ -284,25 +306,14 @@ export class RagClient {
       }
     };
 
-    const reader = res.body?.getReader();
-    if (reader) {
-      const decoder = new TextDecoder();
-      let pending = "";
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        pending += decoder.decode(value, { stream: true });
-        let nl = pending.indexOf("\n");
-        while (nl >= 0) {
-          onLine(pending.slice(0, nl));
-          pending = pending.slice(nl + 1);
-          nl = pending.indexOf("\n");
-        }
-      }
-      onLine(pending);
-    } else {
-      for (const line of (await res.text()).split("\n")) onLine(line);
-    }
+    await this.streamNdjson(
+      "assistant",
+      "/auth/student/assistant/chat/stream",
+      opts.token,
+      body,
+      opts.signal,
+      onLine,
+    );
 
     if (handlers.onSentence) {
       const rest = sentences.flush();

@@ -39,6 +39,26 @@ export function packPcm(samples: Int16Array, sampleRate = PCM_SAMPLE_RATE, end =
   return buf;
 }
 
+/** Mono 16-bit PCM wrapped in a 44-byte RIFF/WAVE header. */
+export function int16ToWav(samples: Int16Array, sampleRate = PCM_SAMPLE_RATE): Buffer {
+  const data = samples.length * 2;
+  const buf = Buffer.alloc(44 + data);
+  buf.write("RIFF", 0, "ascii");
+  buf.writeUInt32LE(36 + data, 4);
+  buf.write("WAVEfmt ", 8, "ascii");
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20);
+  buf.writeUInt16LE(1, 22);
+  buf.writeUInt32LE(sampleRate, 24);
+  buf.writeUInt32LE(sampleRate * 2, 28);
+  buf.writeUInt16LE(2, 32);
+  buf.writeUInt16LE(16, 34);
+  buf.write("data", 36, "ascii");
+  buf.writeUInt32LE(data, 40);
+  Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength).copy(buf, 44);
+  return buf;
+}
+
 export function unpackPcm(buf: Buffer): { samples: Int16Array; sampleRate: number; end: boolean } {
   const sampleRate = buf.readUInt32LE(0);
   const end = (buf.readUInt8(4) & 1) === 1;

@@ -15,6 +15,7 @@ export class ProgressService implements OnModuleInit {
         connectionString: config.databaseUrl,
         max: 2,
         connectionTimeoutMillis: 3000,
+        query_timeout: 5000,
       });
       await this.pool.query(`
         CREATE TABLE IF NOT EXISTS rtc_voice_sessions (
@@ -90,18 +91,27 @@ export class ProgressService implements OnModuleInit {
   async endSession(id: string, startedAt: number): Promise<void> {
     if (!this.pool) return;
     const duration = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
-    await this.pool.query(
-      `UPDATE rtc_voice_sessions SET ended_at=NOW(), duration_seconds=$2, status='ended' WHERE id=$1`,
-      [id, duration],
-    );
+    try {
+      await this.pool.query(
+        `UPDATE rtc_voice_sessions SET ended_at=NOW(), duration_seconds=$2, status='ended' WHERE id=$1`,
+        [id, duration],
+      );
+    } catch (err) {
+      this.log.warn(`endSession skip: ${err}`);
+    }
   }
 
+  /** Analytics only — a database hiccup must never replace the student's answer with an error. */
   async recordMessage(conversationId: string, role: string, content: string): Promise<void> {
     if (!this.pool) return;
-    await this.pool.query(
-      `INSERT INTO rtc_conversation_messages (conversation_id, role, content) VALUES ($1,$2,$3)`,
-      [conversationId, role, content.slice(0, 8000)],
-    );
+    try {
+      await this.pool.query(
+        `INSERT INTO rtc_conversation_messages (conversation_id, role, content) VALUES ($1,$2,$3)`,
+        [conversationId, role, content.slice(0, 8000)],
+      );
+    } catch (err) {
+      this.log.warn(`recordMessage skip: ${err}`);
+    }
   }
 
   async recordGrade(opts: {

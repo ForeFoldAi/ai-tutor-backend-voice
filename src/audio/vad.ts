@@ -18,7 +18,9 @@ export function loadSilero(): Promise<SileroInfer> {
       const model = await AutoModel.from_pretrained(MODEL_ID, {
         config: { model_type: "custom" } as never,
         dtype: "fp32",
-      });
+        // One tiny model per 32 ms window per student: extra threads only contend.
+        session_options: { intraOpNumThreads: 1, interOpNumThreads: 1 },
+      } as never);
       const sr = new Tensor("int64", BigInt64Array.from([BigInt(PCM_SAMPLE_RATE)]), []);
       return async (frame, state) => {
         const input = new Tensor("float32", frame, [1, frame.length]);
@@ -34,6 +36,10 @@ export function loadSilero(): Promise<SileroInfer> {
         return { p, state: next };
       };
     })();
+    // A transient download failure must not leave the server deaf until restart.
+    loaded.catch(() => {
+      loaded = null;
+    });
   }
   return loaded;
 }

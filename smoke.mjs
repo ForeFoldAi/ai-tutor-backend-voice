@@ -1,5 +1,5 @@
 // End-to-end smoke check of the voice pipeline: gateway auth -> session ->
-// text turn -> FastAPI RAG -> Kokoro TTS -> PCM downlink over the WS.
+// text turn -> FastAPI RAG -> Edge TTS (via FastAPI) -> PCM downlink over the WS.
 // Skips STT (sends `text`), so it isolates everything else.
 //
 // Needs both servers up (:8080 and :8000) and a student access token:
