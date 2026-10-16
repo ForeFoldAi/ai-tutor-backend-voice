@@ -125,8 +125,12 @@ export class ThinkingFillerService {
   ) {}
 
   private voiceKey(): string {
-    const voice = config.ttsProvider === "edge" ? config.edgeTtsVoice : config.kokoroVoice;
-    return `${config.ttsProvider}:${voice}`;
+    return `edge:${config.edgeTtsVoice}`;
+  }
+
+  /** With the internal token Edge needs no student JWT, so warm at boot. */
+  onModuleInit(): void {
+    if (config.voiceInternalToken) this.warm("");
   }
 
   warm(accessToken: string): void {
@@ -134,8 +138,9 @@ export class ThinkingFillerService {
     const key = this.voiceKey();
     if (this.warmedKey === key || this.warming) return;
     this.warming = this.warmAll(accessToken, key)
-      .then(() => {
-        this.warmedKey = key;
+      .then((complete) => {
+        // Partial warm (Edge hiccup) retries on the next session instead of never.
+        if (complete) this.warmedKey = key;
       })
       .catch((err) => {
         this.log.warn(`filler warm failed: ${err}`);
@@ -145,20 +150,27 @@ export class ThinkingFillerService {
       });
   }
 
-  private async warmAll(accessToken: string, key: string): Promise<void> {
+  private async warmAll(accessToken: string, key: string): Promise<boolean> {
     const t0 = Date.now();
     let cached = 0;
+    let failed = 0;
     for (const phrase of allFillerPhrases()) {
+      if (this.cache.has(`${key}:${phrase}`)) {
+        cached += 1;
+        continue;
+      }
       try {
         const clip = await this.synthesize(phrase, accessToken);
-        if (!clip) continue;
+        if (!clip) continue; // over the duration cap — final, not worth retrying
         this.cache.set(`${key}:${phrase}`, clip);
         cached += 1;
       } catch (err) {
+        failed += 1;
         this.log.warn(`filler synth "${phrase}": ${err}`);
       }
     }
     voiceLog("filler_cache_warmed", { fillerCached: cached, fillerMs: Date.now() - t0 });
+    return failed === 0;
   }
 
   private async synthesize(phrase: string, accessToken: string): Promise<FillerClip | null> {
@@ -297,21 +309,19 @@ export class ThinkingFillerService {
   }
 
   private async llmPhrase(plan: FillerPlan): Promise<string> {
-    const timeoutMs = config.llmFillerTimeoutMs;
     try {
-      const raw = await Promise.race([
-        this.llm.complete(
-          [
-            { role: "system", content: fillerSystemPrompt(plan) },
-            { role: "user", content: plan.utterance.slice(0, 240) },
-          ],
-          32,
-        ),
-        new Promise<string>((resolve) => setTimeout(() => resolve(""), timeoutMs)),
-      ]);
+      // The timeout aborts the request itself, so a slow filler never leaks a fetch.
+      const raw = await this.llm.complete(
+        [
+          { role: "system", content: fillerSystemPrompt(plan) },
+          { role: "user", content: plan.utterance.slice(0, 240) },
+        ],
+        32,
+        { timeoutMs: config.llmFillerTimeoutMs },
+      );
       return sanitizeLlmFillerPhrase(raw);
     } catch (err) {
-      this.log.warn(`llm filler: ${err}`);
+      this.log.debug(`llm filler (canned fallback): ${err}`);
       return "";
     }
   }

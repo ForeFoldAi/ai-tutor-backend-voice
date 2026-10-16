@@ -1,7 +1,16 @@
-import { RagClient, collectionName } from "./rag.client";
+import { RagClient, collectionName, mergeImages } from "./rag.client";
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import type { RagAskOptions } from "./rag.client";
+
+describe("mergeImages", () => {
+  it("adds new figures, keeps earlier ones, drops duplicate urls", () => {
+    const a = { url: "/a" } as never;
+    const b = { url: "/b" } as never;
+    const out = mergeImages([a], [b, { url: "/a" } as never, { url: "/b" } as never]);
+    assert.deepEqual(out.map((i) => i.url), ["/a", "/b"]);
+  });
+});
 
 const ASK_OPTS: RagAskOptions = {
   token: "test-token",
@@ -101,7 +110,7 @@ describe("RagClient askStream", () => {
     assert.deepEqual((posted as { image_ids?: string[] }).image_ids, ["abc123"]);
   });
 
-  it("replaces images when a later related_images event arrives", async () => {
+  it("merges images when a later related_images event arrives", async () => {
     const early = [
       { url: "/auth/catalog/u/a.png", caption: "early", page: 1, figure_number: "2.3" },
     ];
@@ -129,6 +138,28 @@ describe("RagClient askStream", () => {
     assert.equal(emitCount, 2);
     assert.equal(result.images.length, 2);
     assert.equal(result.images[1].figure_number, "2.12");
+  });
+});
+
+describe("RagClient timeouts", () => {
+  const originalFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  it("fails instead of hanging when FastAPI never responds", async () => {
+    const { config } = await import("../../config");
+    const prev = config.ragFirstByteTimeoutMs;
+    config.ragFirstByteTimeoutMs = 50;
+    global.fetch = (_url, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+      });
+    try {
+      await assert.rejects(new RagClient().askStream(ASK_OPTS, {}), /timeout/);
+    } finally {
+      config.ragFirstByteTimeoutMs = prev;
+    }
   });
 });
 

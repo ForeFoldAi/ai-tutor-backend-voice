@@ -59,6 +59,8 @@ const HALLUCINATION_RE = [
 ];
 
 const SHORT_OK = new Set(["ok", "okay", "yes", "no", "hi", "hey", "bye", "stop", "wait", "why", "how"]);
+/** Quiz answers are often a single short number. */
+const NUMBER_WORDS = new Set(["one", "two", "six", "ten", "zero", "four", "five", "nine", "half"]);
 
 /** Whisper often hallucinates bracketed stage directions on silence/noise. */
 const BRACKET_ONLY_RE = /^[\[(]([^[\]()]{1,64})[\])]\.?$/i;
@@ -79,7 +81,7 @@ function isBracketNoise(text: string): boolean {
 
 export function isMeaningfulTranscript(text: string): boolean {
   const raw = (text || "").trim();
-  if (raw.length < 2) return false;
+  if (raw.length < 2 && !/^\d$/.test(raw)) return false;
   if (isBracketNoise(raw)) return false;
   const key = junkKey(raw);
   if (WHISPER_JUNK.has(key)) return false;
@@ -90,7 +92,7 @@ export function isMeaningfulTranscript(text: string): boolean {
   if (words.length === 1) {
     const w = junkKey(words[0]);
     if (WHISPER_JUNK.has(w)) return false;
-    return SHORT_OK.has(w) || w.length >= 4;
+    return SHORT_OK.has(w) || NUMBER_WORDS.has(w) || /^\d+$/.test(w) || w.length >= 4;
   }
   return words.some((w) => w.length >= 2);
 }
@@ -159,6 +161,16 @@ export function isLikelyEcho(user: string, assistant: string): boolean {
   const aset = new Set(a.split(" ").filter((w) => w.length > 2));
   const hit = uw.filter((w) => aset.has(w)).length;
   return hit / uw.length >= 0.7;
+}
+
+/**
+ * Drop the VAD hang (trailing silence that only exists to detect the end of
+ * speech), keeping `padMs` so the last word isn't clipped. Shorter audio is
+ * faster STT and keeps the loudness gate from averaging in 1.5 s of silence.
+ */
+export function trimTrailingHang(pcm: Int16Array, hangMs: number, padMs = 300, sampleRate = 16000): Int16Array {
+  const drop = Math.floor((sampleRate * Math.max(0, hangMs - padMs)) / 1000);
+  return drop > 0 && pcm.length - drop >= sampleRate * 0.2 ? pcm.subarray(0, pcm.length - drop) : pcm;
 }
 
 /** RMS of int16 PCM — gate silence/noise before Whisper hallucinates. */

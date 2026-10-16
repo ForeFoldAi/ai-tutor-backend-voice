@@ -14,9 +14,9 @@ import { SessionOwnershipService } from "../conversation/session-ownership.servi
 import { ConversationSummaryService } from "../conversation/conversation-summary.service";
 import { ProgressService } from "../progress/progress.service";
 import { RagClient, RagAuthError, RagResult } from "../rag/rag.client";
+import type { RagRelatedImage } from "../tutor/interfaces";
 import { AnswerEvaluatorService } from "../tutor/answer-evaluator.service";
 import { nextDifficulty } from "../tutor/difficulty-manager.service";
-import { QueryRewriterService } from "../tutor/query-rewriter.service";
 import { QuestionGeneratorService } from "../tutor/question-generator.service";
 import { afterEvaluate, afterExplainShouldCheck, decideAction } from "../tutor/tutor-orchestrator.service";
 import { classifyReplyIntent, isBareAcknowledgement, dialogueActForUtterance } from "../tutor/reply-intent";
@@ -32,7 +32,13 @@ import {
   userTranscriptCommitted,
   userTranscriptPending,
 } from "./transcript-events";
-import { isLikelyEcho, isMeaningfulTranscript, pcmSpeechRms, postprocessTranscript } from "./stt-quality";
+import {
+  isLikelyEcho,
+  isMeaningfulTranscript,
+  pcmSpeechRms,
+  postprocessTranscript,
+  trimTrailingHang,
+} from "./stt-quality";
 import { WhisperSttProvider } from "./providers/whisper.stt";
 import { TtsProvider } from "./providers/tts.provider";
 import { FillerIntent, PreparedFiller, ThinkingFillerService } from "./thinking-filler.service";
@@ -47,8 +53,14 @@ type EmitPcm = (buf: Buffer) => void;
 
 type Live = {
   sessionId: string;
+  /** Socket that attached this entry; a stale socket's disconnect must not tear down its replacement. */
+  owner: unknown;
   vad: SileroVad;
   chunks: Int16Array[];
+  /** Last ~300 ms before VAD start; Silero fires after the onset, so word starts would be clipped. */
+  preroll: Int16Array[];
+  /** Figure URLs already shown this connection — the same figure every turn is clutter. */
+  shownImages: Set<string>;
   abort: AbortController;
   emit: Emit;
   emitPcm?: EmitPcm;
@@ -116,6 +128,7 @@ type SpeechStream = {
 };
 
 const TTFA_SAMPLES = 8;
+const PREROLL_SAMPLES = Math.floor(PCM_SAMPLE_RATE * 0.3);
 /**
  * A refusal the student should hear as MSG.notInTextbook instead.
  *
@@ -139,7 +152,6 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     private readonly ownership: SessionOwnershipService,
     private readonly summary: ConversationSummaryService,
     private readonly rag: RagClient,
-    private readonly rewriter: QueryRewriterService,
     private readonly evaluator: AnswerEvaluatorService,
     private readonly questions: QuestionGeneratorService,
     private readonly recall: RecallService,
@@ -200,8 +212,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       classLevel: opts.scope.classLevel,
       subject: opts.scope.subject || opts.agentMode || "assistant",
     });
-    // Edge TTS needs a student JWT, so the filler cache cannot warm at boot.
-    // First session of the process pays for it, in the background.
+    // No-op once warm; without VOICE_INTERNAL_TOKEN this is the first chance (needs a student JWT).
     this.filler.warm(opts.token);
     this.current = id;
     return session;
@@ -221,13 +232,22 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     sessionId: string,
     emit: Emit,
     emitPcm?: EmitPcm,
+    owner: unknown = emit,
   ): Promise<"ok" | "owned_elsewhere"> {
     const claim = await this.ownership.claim(sessionId);
     if (claim === "owned_elsewhere") return "owned_elsewhere";
+    const prev = this.live.get(sessionId);
+    if (prev) {
+      prev.abort.abort();
+      this.clearFiller(prev);
+    }
     const live: Live = {
       sessionId,
+      owner,
       vad: new SileroVad({ hangMs: config.vadHangMs }),
       chunks: [],
+      preroll: [],
+      shownImages: new Set(),
       abort: new AbortController(),
       emit,
       emitPcm,
@@ -259,8 +279,10 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
   }
 
   /** Drop live WS state but keep Redis session for resume. */
-  async detach(sessionId: string): Promise<void> {
+  async detach(sessionId: string, owner?: unknown): Promise<void> {
     const live = this.live.get(sessionId);
+    // A resumed socket already replaced this entry — the old socket closing must not kill it.
+    if (owner !== undefined && live && live.owner !== owner) return;
     if (live) {
       live.abort.abort();
       this.clearFiller(live);
@@ -316,12 +338,15 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       this.endUtterance(live);
     }
     if (hadStart) {
-      live.chunks = [samples];
+      live.chunks = [...live.preroll, samples];
+      live.preroll = [];
       if (
         live.pendingPcm &&
         Date.now() - live.pendingAt < config.vadMergeMs &&
         !live.speaking &&
-        !this.fillerAudible(live)
+        !this.fillerAudible(live) &&
+        // A cough/echo must not abort the turn already being answered.
+        pcmSpeechRms(samples) >= config.sttMinSpeechRms
       ) {
         // Student was only pausing — drop the half-question turn and answer both halves as one.
         live.chunks = [live.pendingPcm, samples];
@@ -342,13 +367,19 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       }
     } else if (live.chunks.length > 0 || events.includes("speech")) {
       live.chunks.push(samples);
+    } else {
+      live.preroll.push(samples);
+      let n = live.preroll.reduce((a, b) => a + b.length, 0);
+      while (live.preroll.length > 1 && n - live.preroll[0].length >= PREROLL_SAMPLES) {
+        n -= live.preroll.shift()!.length;
+      }
     }
     if (hadStop && !restarted) this.endUtterance(live);
   }
 
   private endUtterance(live: Live): void {
     live.emit("student_stopped_speaking");
-    const merged = concat(live.chunks);
+    const merged = trimTrailingHang(concat(live.chunks), config.vadHangMs, 300, PCM_SAMPLE_RATE);
     live.chunks = [];
     if (Date.now() - live.lastSpokeAt < config.sttPostPlaybackMs) {
       live.vad.reset();
@@ -392,6 +423,13 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       live.turnId += 1;
       live.abort = new AbortController();
       live.speaking = false;
+      // Reset before any await: the client sends the barge-in words right after
+      // this message, and clearing later would throw them away.
+      live.chunks = [];
+      live.preroll = [];
+      live.pendingPcm = null;
+      live.vad.reset();
+      live.lastSpokeAt = Date.now();
     }
     const session = await this.memory.get(sessionId);
     if (session) {
@@ -400,12 +438,6 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     }
     live?.emit("ai_interrupted");
     live?.emit("student_started_speaking");
-    if (live) {
-      live.chunks = [];
-      live.pendingPcm = null;
-      live.vad.reset();
-      live.lastSpokeAt = Date.now();
-    }
   }
 
   async end(sessionId: string): Promise<void> {
@@ -435,6 +467,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     const session = await this.memory.get(sessionId);
     if (!session) {
       live?.emit("ai_stopped_processing");
+      live?.emit("voice_error", { message: MSG.sessionLost });
       return;
     }
     session.state = "PROCESSING";
@@ -450,8 +483,11 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
 
     let text = "";
     try {
-      const f32 = int16ToFloat(pcm);
-      text = await this.stt.transcribe(f32, PCM_SAMPLE_RATE);
+      text = await this.stt.transcribe(pcm, {
+        token: session.accessToken,
+        subject: session.scope.subject,
+        prompt: sttPrompt(session),
+      });
     } catch (err) {
       this.log.warn(`stt ${err}`);
       if (superseded()) return;
@@ -474,7 +510,12 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
   }
 
   /** Fixed-line TTS greet for Ask AI — does not call student_assistant. */
-  async speakAssistantGreeting(sessionId: string): Promise<void> {
+  speakAssistantGreeting(sessionId: string): Promise<void> {
+    // Queued like a turn: run alongside the first question and its beginSpeech would abort that turn.
+    return this.enqueueTurn(sessionId, () => this.greet(sessionId));
+  }
+
+  private async greet(sessionId: string): Promise<void> {
     const text = "Hi! Ask me anything about school or the platform.";
     const live = this.live.get(sessionId);
     const session = await this.memory.get(sessionId);
@@ -494,7 +535,10 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
   ): Promise<void> {
     const live = this.live.get(sessionId);
     const session = await this.memory.get(sessionId);
-    if (!session) return;
+    if (!session) {
+      live?.emit("voice_error", { message: MSG.sessionLost });
+      return;
+    }
     session.state = "THINKING";
     await this.memory.save(session);
     live?.emit("ai_started_processing");
@@ -564,8 +608,6 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     let ragMs = 0;
     let retrievedIds: string[] = [];
     let pages: number[] = [];
-    /** Retrieval may rewrite; LLM/history always keep the raw student utterance. */
-    let retrievalQuery = utterance;
     const recall = isRecallQuestion(utterance);
 
     try {
@@ -629,7 +671,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         session.tutor.difficulty = next.difficulty;
         session.tutor.consecutiveCorrect = next.consecutiveCorrect;
         session.tutor.consecutiveIncorrect = next.consecutiveIncorrect;
-        await this.progress.recordGrade({
+        void this.progress.recordGrade({
           studentId: session.studentId,
           classLevel: session.scope.classLevel,
           subject: session.scope.subject,
@@ -640,7 +682,6 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
           sessionId,
         });
         live?.emit("answer_evaluated", { grade, action, difficulty: session.tutor.difficulty });
-        retrievalQuery = await this.rewriter.rewrite(utterance, history, chapterName);
         // The verdict is known before retrieval runs, so say it now — the
         // student hears "Exactly!" while the explanation is still being fetched.
         this.streamSay(live, session, speech, prefix);
@@ -669,7 +710,6 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       } else {
         // New question / refusal while a check was open — drop the quiz latch.
         if (session.tutor.awaitingAnswer) session.tutor.awaitingAnswer = false;
-        retrievalQuery = await this.rewriter.rewrite(utterance, history, chapterName);
         const rag = await this.streamRag({
           session,
           live,
@@ -695,7 +735,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
           reply = MSG.notInTextbook;
         }
         session.tutor.currentConcept =
-          topicFromQuestion(retrievalQuery) || session.tutor.currentConcept;
+          topicFromQuestion(utterance) || session.tutor.currentConcept;
         session.currentTopic = session.tutor.currentConcept;
         if (followup === "simplify") action = "SIMPLIFY";
         if (followup === "example") action = "PROVIDE_EXAMPLE";
@@ -751,12 +791,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         ? // Internal greet prompt is not a student utterance.
           [...history, { role: "assistant", content: reply }]
         : [...history, { role: "user", content: utterance }, { role: "assistant", content: reply }];
-      session.summary = await this.summary.maybeFold(turns, session.summary);
       session.recentMessages = turns;
-      if (!opts.synthetic) {
-        await this.progress.recordMessage(session.conversationId, "user", utterance);
-      }
-      await this.progress.recordMessage(session.conversationId, "assistant", reply);
       await this.memory.save(session);
 
       voiceLog("turn", {
@@ -775,7 +810,6 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         streamed: speech.dispatched > 0,
         fillerCohort: live?.fillerCohort,
         isRecall: recall,
-        retrievalRewrote: retrievalQuery.trim() !== utterance.trim(),
         synthetic: Boolean(opts.synthetic),
       });
 
@@ -790,6 +824,13 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       } else {
         await this.speak(sessionId, reply, { turnId, signal, action });
       }
+      // Fold + DB writes after the reply is out; the turn queue still finishes them before the next turn.
+      session.summary = await this.summary.maybeFold(turns, session.summary);
+      if (!opts.synthetic) {
+        await this.progress.recordMessage(session.conversationId, "user", utterance);
+      }
+      await this.progress.recordMessage(session.conversationId, "assistant", reply);
+      await this.memory.save(session);
     } catch (err) {
       this.log.warn(`turn ${err}`);
       if (signal?.aborted) {
@@ -798,7 +839,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       }
       session.state = "ERROR";
       await this.memory.save(session);
-      live?.emit("voice_error", { message: MSG.llmFail });
+      live?.emit("voice_error", { message: MSG.llmFail, recoverable: true });
       await this.speak(sessionId, MSG.llmFail);
     } finally {
       // A turn that ends without ever emitting audio (TTS threw) would
@@ -819,7 +860,10 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
   ): Promise<void> {
     const live = this.live.get(sessionId);
     const session = await this.memory.get(sessionId);
-    if (!session || !session.agentMode) return;
+    if (!session || !session.agentMode) {
+      live?.emit("voice_error", { message: MSG.sessionLost });
+      return;
+    }
 
     const history = session.recentMessages;
     const signal = live?.abort.signal;
@@ -882,10 +926,6 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         ? [...history, { role: "assistant", content: reply }]
         : [...history, { role: "user", content: utterance }, { role: "assistant", content: reply }];
       session.recentMessages = turns;
-      if (!opts.synthetic) {
-        await this.progress.recordMessage(session.conversationId, "user", utterance);
-      }
-      await this.progress.recordMessage(session.conversationId, "assistant", reply);
       await this.memory.save(session);
 
       voiceLog("turn", {
@@ -907,6 +947,10 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       } else {
         await this.speak(sessionId, reply, { turnId, signal, action: "ANSWER" });
       }
+      if (!opts.synthetic) {
+        await this.progress.recordMessage(session.conversationId, "user", utterance);
+      }
+      await this.progress.recordMessage(session.conversationId, "assistant", reply);
     } catch (err) {
       this.log.warn(`assistant turn ${err}`);
       if (signal?.aborted) {
@@ -915,7 +959,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       }
       session.state = "ERROR";
       await this.memory.save(session);
-      live?.emit("voice_error", { message: MSG.llmFail });
+      live?.emit("voice_error", { message: MSG.llmFail, recoverable: true });
       await this.speak(sessionId, MSG.llmFail);
     } finally {
       if (live) this.clearFiller(live);
@@ -1100,10 +1144,12 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
 
     const committed = speech.dispatched > 0;
     let spoken = 0;
+    let said = "";
     try {
       const result = await this.rag.askAssistantStream(ask, {
         onSentence: (sentence) => {
           spoken += 1;
+          said = `${said} ${sentence}`;
           this.streamSay(live, session, speech, sentence);
         },
       });
@@ -1120,8 +1166,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         return { answer: MSG.authExpired, retrievedIds: [], pages: [], images: [], ms: 0 };
       }
       this.log.warn(`assistant stream ${err}`);
-      if (committed) this.streamSay(live, session, speech, MSG.ragFail);
-      return { answer: MSG.ragFail, retrievedIds: [], pages: [], images: [], ms: 0 };
+      return this.failMidStream(live, session, speech, committed || spoken > 0, said);
     }
   }
 
@@ -1184,7 +1229,11 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
 
     if (!this.streaming(live)) {
       const result = await this.safeRag(ask, live);
-      if (result.images.length) opts.live?.emit("related_images", { images: result.images });
+      const l = opts.live;
+      if (l && result.images.length && turnStillActive(signal, speech.turnId, l.turnId)) {
+        const images = freshImages(l, result.images);
+        if (images.length) l.emit("related_images", { images, turnId: speech.turnId });
+      }
       return result;
     }
 
@@ -1193,6 +1242,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     // its own text on the wire or the student hears a truncated answer.
     const committed = speech.dispatched > 0;
     let spoken = 0;
+    let said = "";
     let heldBack = false;
     try {
       const result = await this.rag.askStream(ask, {
@@ -1203,6 +1253,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
             return;
           }
           spoken += 1;
+          said = `${said} ${sentence}`;
           this.streamSay(live, session, speech, sentence);
         },
         onReplace: () => {
@@ -1214,8 +1265,11 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         },
         onRelatedImages: (images) => {
           if (!live || !images.length) return;
-          if (!turnStillActive(signal, speech.turnId, live.turnId)) return;
-          live.emit("related_images", { images });
+          // An answer the student already heard keeps its figures even after a barge-in;
+          // they attach to that turn's line on the client, so they can't bleed into the next one.
+          if (speech.dispatched === 0 && !turnStillActive(signal, speech.turnId, live.turnId)) return;
+          const fresh = freshImages(live, images);
+          if (fresh.length) live.emit("related_images", { images: fresh, turnId: speech.turnId });
         },
       });
       if (committed && spoken === 0 && !opts.guardNotFound && result.answer) {
@@ -1231,9 +1285,24 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         return { answer: MSG.authExpired, retrievedIds: [], pages: [], images: [], ms: 0 };
       }
       this.log.warn(`rag stream ${err}`);
-      if (committed) this.streamSay(live, session, speech, MSG.ragFail);
-      return { answer: MSG.ragFail, retrievedIds: [], pages: [], images: [], ms: 0 };
+      return this.failMidStream(live, session, speech, committed || spoken > 0, said);
     }
+  }
+
+  /**
+   * FastAPI failed or timed out. If audio already went out, the apology has to go
+   * out the same way (the caller only speaks a tail), and the transcript keeps
+   * what the student actually heard instead of being replaced by the error.
+   */
+  private failMidStream(
+    live: Live | undefined,
+    session: VoiceSession,
+    speech: SpeechStream,
+    streaming: boolean,
+    said: string,
+  ): RagResult {
+    if (streaming) this.streamSay(live, session, speech, MSG.ragFail);
+    return { answer: `${said} ${MSG.ragFail}`.trim(), retrievedIds: [], pages: [], images: [], ms: 0 };
   }
 
   private emitAuthExpired(live: Live | undefined): void {
@@ -1267,16 +1336,12 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     speech.queue = speech.queue
       .then(async () => {
         if (speech.failed || !turnStillActive(speech.signal, speech.turnId, live?.turnId)) return;
-        if (!speech.begun) {
-          speech.begun = true;
-          await this.beginSpeech(live, session, speech.turnId);
-        }
         await this.speakChunk(live, session, chunk, speech.signal, speech.turnId, speech);
       })
       .catch((err) => {
         speech.failed = true;
         this.log.warn(`tts stream ${err}`);
-        live.emit("voice_error", { message: MSG.ttsFail });
+        live.emit("voice_error", { message: MSG.ttsFail, recoverable: true });
       });
   }
 
@@ -1286,7 +1351,12 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     speech: SpeechStream,
   ): Promise<void> {
     await speech.queue;
-    if (!live || !speech.begun) return;
+    if (!live) return;
+    if (!speech.begun) {
+      // No audio ever went out (TTS failed / nothing speakable): still hand the mic back.
+      await this.releaseTurnAudio(live, session);
+      return;
+    }
     voiceLog("tts", { sessionId: live.sessionId, ttsMs: Date.now() - live.turnStartedAt });
     await this.endSpeech(live, session);
   }
@@ -1341,6 +1411,13 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     // Synthesis is a network round trip with Edge TTS — the student may well
     // have barged in while it was out.
     if (cancelled()) return false;
+    // "Speaking" starts with real audio in hand, so the UI never shows speaking over silence
+    // (and never blocks the mic) while Edge is still synthesizing or retrying.
+    if (speech && !speech.begun) {
+      speech.begun = true;
+      await this.beginSpeech(live, session, turnId);
+      if (cancelled()) return false;
+    }
     const at16 = resample(pcm, sampleRate, PCM_SAMPLE_RATE);
     const packed = packPcm(floatToInt16(at16), PCM_SAMPLE_RATE, false);
     // "Answer ready" is the first frame on the wire, not the reply string:
@@ -1375,6 +1452,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     live.speaking = false;
     live.lastSpokeAt = Date.now();
     live.chunks = [];
+    live.preroll = [];
     live.vad.reset();
     if (!live.abort.signal.aborted) {
       session.state = "LISTENING";
@@ -1404,8 +1482,6 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       spokenText: "",
       transcriptAction: opts.action,
     };
-    await this.beginSpeech(live, session, turnId);
-    speech.begun = true;
     // Full reply is already known on the buffered path — show it with first audio.
     if (turnId > 0 && text.trim()) {
       speech.transcriptFinal = true;
@@ -1419,7 +1495,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       voiceLog("tts", { sessionId, ttsMs: Date.now() - t0 });
     } catch (err) {
       this.log.warn(`tts ${err}`);
-      live.emit("voice_error", { message: MSG.ttsFail });
+      live.emit("voice_error", { message: MSG.ttsFail, recoverable: true });
     }
     await this.endSpeech(live, session);
   }
@@ -1454,6 +1530,33 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       live.emit("affect_hint", { hint: meta.affect_hint, primary: meta.affect_primary });
     }
   }
+}
+
+/** Lesson words for Whisper's initial prompt — biases decoding toward the chapter's vocabulary. */
+/** Drops figures this connection already showed and marks the rest as shown. */
+export function freshImages(live: { shownImages: Set<string> }, images: RagRelatedImage[]): RagRelatedImage[] {
+  return images.filter((img) => {
+    const key = img.url.split("?")[0];
+    if (live.shownImages.has(key)) return false;
+    live.shownImages.add(key);
+    return true;
+  });
+}
+
+export function sttPrompt(session: VoiceSession): string {
+  const parts = [
+    ...session.scope.chapterNames,
+    session.scope.chapter,
+    session.tutor.currentConcept,
+    session.currentTopic,
+  ];
+  const topic = [...new Set(parts.map((p) => String(p || "").trim()).filter(Boolean))].join(". ");
+  // The student usually answers the tutor's last question with its words ("the fun, the help…"),
+  // so that question biases Whisper toward "help" over a sound-alike like "hate".
+  const lastReply = [...(session.recentMessages || [])].reverse().find((t) => t.role === "assistant")?.content || "";
+  const asked = lastReply.match(/[^.!?]*\?/g)?.pop()?.trim() || "";
+  // Last in the prompt so FastAPI's 300-char cap trims the chapter names first, not the question.
+  return [topic, asked.slice(-200)].filter(Boolean).join(". ");
 }
 
 function concat(parts: Int16Array[]): Int16Array {

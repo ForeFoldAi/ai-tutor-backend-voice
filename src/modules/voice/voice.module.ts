@@ -5,7 +5,6 @@ import { RagModule } from "../rag/rag.module";
 import { TutorModule } from "../tutor/tutor.module";
 import { LlmModule } from "../llm/llm.module";
 import { EdgeTtsProvider } from "./providers/edge.tts";
-import { KokoroTtsProvider } from "./providers/kokoro.tts";
 import { TtsProvider } from "./providers/tts.provider";
 import { WhisperSttProvider } from "./providers/whisper.stt";
 import { ThinkingFillerService } from "./thinking-filler.service";
@@ -22,7 +21,6 @@ import { WebrtcService } from "./webrtc.service";
     VoiceGateway,
     WebrtcService,
     WhisperSttProvider,
-    KokoroTtsProvider,
     EdgeTtsProvider,
     TtsProvider,
     ThinkingFillerService,

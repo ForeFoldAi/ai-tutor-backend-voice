@@ -6,8 +6,17 @@ export interface IVoiceProvider {
   interrupt(): Promise<void>;
 }
 
+export type SttHints = {
+  /** Student JWT, used only when VOICE_INTERNAL_TOKEN is unset. */
+  token?: string;
+  subject?: string;
+  /** Lesson vocabulary (chapter / topic) to bias decoding. */
+  prompt?: string;
+};
+
 export interface ISTTProvider {
-  transcribe(pcm: Float32Array, sampleRate: number): Promise<string>;
+  /** Mono 16 kHz PCM. */
+  transcribe(pcm: Int16Array, hints?: SttHints): Promise<string>;
 }
 
 export interface ITTSProvider {

@@ -1,54 +1,38 @@
-import { Injectable, Logger, OnModuleInit } from "@nestjs/common";
+import { Injectable } from "@nestjs/common";
 import { config } from "../../../config";
-import { resample } from "../../../audio/pcm";
-import { ISTTProvider } from "../interfaces/voice-provider";
+import { int16ToWav, PCM_SAMPLE_RATE } from "../../../audio/pcm";
+import { ISTTProvider, SttHints } from "../interfaces/voice-provider";
 
+/**
+ * Whisper STT, by way of FastAPI's faster-whisper (CTranslate2 int8).
+ *
+ * Not in-process: transformers.js runs ONNX synchronously on the Node main
+ * thread (stalling every session's VAD and audio) and cannot take a
+ * vocabulary prompt. faster-whisper is several times faster on CPU and the
+ * chapter-aware initial prompt is what fixes "joint family" -> "your own family".
+ */
 @Injectable()
-export class WhisperSttProvider implements ISTTProvider, OnModuleInit {
-  private readonly log = new Logger(WhisperSttProvider.name);
-  private pipe: ((input: unknown, opts?: unknown) => Promise<unknown>) | null = null;
-  private loading: Promise<void> | null = null;
+export class WhisperSttProvider implements ISTTProvider {
+  async transcribe(pcm: Int16Array, hints: SttHints = {}): Promise<string> {
+    const headers: Record<string, string> = {};
+    if (config.voiceInternalToken) headers["X-Voice-Token"] = config.voiceInternalToken;
+    else if (hints.token) headers.Authorization = `Bearer ${hints.token}`;
+    else throw new Error("stt needs VOICE_INTERNAL_TOKEN or a student access token");
 
-  async onModuleInit(): Promise<void> {
-    this.warm().catch((err) => this.log.warn(`whisper preload: ${err}`));
-  }
+    const form = new FormData();
+    form.append("audio", new Blob([new Uint8Array(int16ToWav(pcm, PCM_SAMPLE_RATE))], { type: "audio/wav" }), "utt.wav");
+    form.append("language", "en");
+    if (hints.subject) form.append("subject_name", hints.subject);
+    if (hints.prompt) form.append("prompt", hints.prompt);
 
-  private async warm(): Promise<void> {
-    if (this.pipe) return;
-    if (!this.loading) {
-      this.loading = (async () => {
-        const { pipeline } = await import("@huggingface/transformers");
-        const asr = await pipeline("automatic-speech-recognition", config.whisperModel);
-        this.pipe = (input: unknown, opts?: unknown) => asr(input as never, opts as never) as Promise<unknown>;
-        this.log.log(`whisper ready ${config.whisperModel}`);
-      })();
-    }
-    await this.loading;
-  }
-
-  async transcribe(pcm: Float32Array, sampleRate: number): Promise<string> {
-    await this.warm();
-    if (!this.pipe) throw new Error("stt unavailable");
-    const audio = sampleRate === 16000 ? pcm : resample(pcm, sampleRate, 16000);
-    const opts = {
-      return_timestamps: false,
-      chunk_length_s: 30,
-      stride_length_s: 5,
-      language: "english",
-      task: "transcribe",
-    };
-    let out: unknown;
-    try {
-      out = await this.pipe({ array: audio, sampling_rate: 16000 }, opts);
-    } catch {
-      try {
-        out = await this.pipe({ array: audio, sampling_rate: 16000 });
-      } catch {
-        out = await this.pipe(audio);
-      }
-    }
-    if (typeof out === "string") return out.trim();
-    const text = (out as { text?: string })?.text || "";
-    return text.trim();
+    const res = await fetch(`${config.tutorApiUrl}/auth/voice-transcribe`, {
+      method: "POST",
+      headers,
+      body: form,
+      signal: AbortSignal.timeout(config.sttTimeoutMs),
+    });
+    if (!res.ok) throw new Error(`stt http ${res.status}`);
+    const body = (await res.json()) as { transcript?: string };
+    return String(body.transcript || "").trim();
   }
 }

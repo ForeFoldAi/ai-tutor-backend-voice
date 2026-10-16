@@ -13,11 +13,8 @@ async function bootstrap() {
   app.enableCors({ origin: config.corsOrigins, credentials: true });
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
   await app.listen(config.port);
-  const edgeAuth = config.voiceInternalToken ? "internal-token" : "student-jwt";
-  console.log(
-    `voice rtc listening on ${config.port} | TTS=${config.ttsProvider}` +
-      (config.ttsProvider === "edge" ? ` (${config.edgeTtsVoice}, auth=${edgeAuth}, fallback=${config.ttsEdgeFallback})` : ""),
-  );
+  const auth = config.voiceInternalToken ? "internal-token" : "student-jwt";
+  console.log(`voice rtc listening on ${config.port} | TTS=edge (${config.edgeTtsVoice}) | STT=fastapi | auth=${auth}`);
 }
 
 void bootstrap();

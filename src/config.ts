@@ -51,11 +51,17 @@ export const config = {
   llmBaseUrl: env("LLM_BASE_URL", "https://api.mistral.ai/v1").replace(/\/$/, ""),
   llmApiKey: env("LLM_API_KEY") || env("MISTRAL_API_KEY"),
   llmModel: env("LLM_MODEL", "mistral-small-latest"),
+  /** Orchestration LLM calls (grade, quiz, recall, summary). */
+  llmTimeoutMs: envInt("LLM_TIMEOUT_MS", 10000),
+  /** FastAPI RAG: max wait for the response to start (headers), and for each stream chunk after. */
+  ragFirstByteTimeoutMs: envInt("RAG_FIRST_BYTE_TIMEOUT_MS", 20000),
+  ragIdleTimeoutMs: envInt("RAG_IDLE_TIMEOUT_MS", 20000),
   stunUrl: env("STUN_URL", "stun:stun.l.google.com:19302"),
   turnUrl: env("TURN_URL"),
   turnUsername: env("TURN_USERNAME"),
   turnCredential: env("TURN_CREDENTIAL"),
-  whisperModel: env("WHISPER_MODEL", "Xenova/whisper-tiny.en"),
+  /** FastAPI faster-whisper round trip; on timeout the student hears MSG.sttFail. */
+  sttTimeoutMs: envInt("STT_TIMEOUT_MS", 8000),
   /** Min captured speech before STT — shorter clips are usually VAD false stops. */
   sttMinUtteranceMs: envInt("STT_MIN_UTTERANCE_MS", 350),
   /** Min RMS on captured PCM — rejects silence/noise Whisper labels as (laughing). */
@@ -64,19 +70,18 @@ export const config = {
   sttPostPlaybackMs: envInt("STT_POST_PLAYBACK_MS", 1000),
   /** Silence that ends a student turn. 900ms cut kids off mid-question while they thought. */
   vadHangMs: envInt("VAD_HANG_MS", 1500),
-  /** Speech resumed this soon after a turn ended, before any reply audio, joins that turn. */
-  vadMergeMs: envInt("VAD_MERGE_MS", 6000),
-  /** kokoro (local, en-US/en-GB) | edge (Microsoft, has en-IN voices) */
-  ttsProvider: env("TTS_PROVIDER", "kokoro").toLowerCase(),
-  kokoroVoice: env("KOKORO_VOICE", "af_heart"),
-  kokoroDtype: env("KOKORO_DTYPE", "q8"),
+  /**
+   * Speech resumed this soon after a turn ended, before any reply audio, joins that turn.
+   * Counted after the VAD_HANG_MS silence, so 2500 tolerates a ~4 s mid-sentence pause; longer
+   * glued a repeated or new question onto the previous one while it was still being answered.
+   */
+  vadMergeMs: envInt("VAD_MERGE_MS", 2500),
+  /** Edge (via FastAPI) is the only TTS engine. en-IN-NeerjaNeural | en-IN-PrabhatNeural */
   edgeTtsVoice: env("EDGE_TTS_VOICE", "en-IN-NeerjaNeural"),
-  edgeTtsRate: env("EDGE_TTS_RATE", "+0%"),
-  edgeTtsTimeoutMs: envInt("EDGE_TTS_TIMEOUT_MS", 15000),
-  /** Shared secret with FastAPI VOICE_INTERNAL_TOKEN — Edge TTS without student JWT. */
+  /** Per attempt; one retry follows, so worst case is ~2x this before a voice_error. */
+  edgeTtsTimeoutMs: envInt("EDGE_TTS_TIMEOUT_MS", 8000),
+  /** Shared secret with FastAPI VOICE_INTERNAL_TOKEN — STT/TTS without a student JWT. */
   voiceInternalToken: env("VOICE_INTERNAL_TOKEN"),
-  /** When false and TTS_PROVIDER=edge, do not fall back to Kokoro on Edge errors. */
-  ttsEdgeFallback: envBool("TTS_EDGE_FALLBACK", true),
   /** Short cached "let me think" audio played while a slow turn is still working. */
   thinkingFiller: envBool("VOICE_THINKING_FILLER", true),
   fillerDelayMs: envInt("VOICE_FILLER_DELAY_MS", 700),
@@ -87,8 +92,12 @@ export const config = {
   fillerAdaptive: envBool("VOICE_FILLER_ADAPTIVE", true),
   /** Fraction of students who hear fillers, for measuring the effect. 1 = everyone. */
   fillerSampleRate: envRate("VOICE_FILLER_SAMPLE_RATE", 1),
-  /** Parallel tiny LLM line matched to the student prompt; falls back to canned. */
-  llmFiller: envBool("VOICE_LLM_FILLER", true),
+  /**
+   * Parallel tiny LLM line matched to the student prompt; falls back to canned.
+   * Off by default: it is one extra LLM call per turn that hits provider rate limits (429)
+   * and competes with the actual answer for the same quota.
+   */
+  llmFiller: envBool("VOICE_LLM_FILLER", false),
   /** Must finish before/around fillerDelayMs or we use the canned clip. */
   llmFillerTimeoutMs: envInt("VOICE_LLM_FILLER_TIMEOUT_MS", 900),
   /** When true, LLM asks check-ins naturally instead of scripted quiz append. */
