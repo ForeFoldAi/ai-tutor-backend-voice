@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnModuleDestroy } from "@nestjs/common";
 import { createRedisClient } from "../../common/redis-client";
 import { config } from "../../config";
-import { ChatTurn, FastApiTutorState, SessionScope, TutorSnapshot, VoiceState } from "../tutor/interfaces";
+import { ChatTurn, FastApiTutorState, RagRelatedImage, SessionScope, TutorSnapshot, VoiceState } from "../tutor/interfaces";
 import { defaultSnapshot } from "../tutor/tutor-state.service";
 
 /** Ask AI Tutor modes — when set, Nest routes turns to student_assistant (not chapter RAG). */
@@ -28,6 +28,8 @@ export type VoiceSession = {
   quizAttempts: number;
   lastQuizQuestion: string;
   lastFillerPhrase: string;
+  /** Textbook figures shown this session — the only figures a quiz question may point at. */
+  figures: RagRelatedImage[];
 };
 
 const key = (id: string) => `voice:rtc:${id}`;
@@ -85,6 +87,8 @@ export class ConversationMemoryService implements OnModuleDestroy {
       session.quizAttempts = session.quizAttempts ?? 0;
       session.lastQuizQuestion = session.lastQuizQuestion ?? "";
       session.lastFillerPhrase = session.lastFillerPhrase ?? "";
+      session.figures = session.figures ?? [];
+      session.tutor.quiz = session.tutor.quiz ?? [];
       // agentMode may be absent on older Redis snapshots — leave undefined
       this.mem.set(id, session);
       this.redisFailures = 0;
@@ -105,7 +109,7 @@ export class ConversationMemoryService implements OnModuleDestroy {
     }
   }
 
-  create(partial: Omit<VoiceSession, "tutor" | "recentMessages" | "summary" | "state" | "currentTopic" | "startedAt" | "tutorState" | "explainedPoints" | "affectTrajectory" | "quizAttempts" | "lastQuizQuestion" | "lastFillerPhrase"> & Partial<VoiceSession>): VoiceSession {
+  create(partial: Omit<VoiceSession, "tutor" | "recentMessages" | "summary" | "state" | "currentTopic" | "startedAt" | "tutorState" | "explainedPoints" | "affectTrajectory" | "quizAttempts" | "lastQuizQuestion" | "lastFillerPhrase" | "figures"> & Partial<VoiceSession>): VoiceSession {
     return {
       tutor: defaultSnapshot(),
       recentMessages: [],
@@ -119,6 +123,7 @@ export class ConversationMemoryService implements OnModuleDestroy {
       quizAttempts: 0,
       lastQuizQuestion: "",
       lastFillerPhrase: "",
+      figures: [],
       ...partial,
     };
   }

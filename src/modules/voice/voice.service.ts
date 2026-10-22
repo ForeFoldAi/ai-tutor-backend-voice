@@ -13,13 +13,23 @@ import {
 import { SessionOwnershipService } from "../conversation/session-ownership.service";
 import { ConversationSummaryService } from "../conversation/conversation-summary.service";
 import { ProgressService } from "../progress/progress.service";
-import { RagClient, RagAuthError, RagResult } from "../rag/rag.client";
-import type { RagRelatedImage } from "../tutor/interfaces";
+import { RagClient, RagAuthError, RagResult, mergeImages } from "../rag/rag.client";
+import type { QuizItem, RagRelatedImage } from "../tutor/interfaces";
 import { AnswerEvaluatorService } from "../tutor/answer-evaluator.service";
 import { nextDifficulty } from "../tutor/difficulty-manager.service";
 import { QuestionGeneratorService } from "../tutor/question-generator.service";
-import { afterEvaluate, afterExplainShouldCheck, decideAction } from "../tutor/tutor-orchestrator.service";
-import { classifyReplyIntent, isBareAcknowledgement, dialogueActForUtterance } from "../tutor/reply-intent";
+import {
+  afterExplainShouldCheck,
+  applyQuizGrades,
+  decideAction,
+  openQuizIndexes,
+} from "../tutor/tutor-orchestrator.service";
+import {
+  classifyReplyIntent,
+  isBareAcknowledgement,
+  dialogueActForUtterance,
+  pendingQuestion,
+} from "../tutor/reply-intent";
 import type { DialogueAct } from "../tutor/reply-intent";
 import { followupIntent, isRecallQuestion, topicFromQuestion } from "../tutor/query-rewriter";
 import { NestFollowupIntent } from "../tutor/interfaces";
@@ -553,7 +563,12 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     const followup = followupIntent(utterance);
     const replyIntent = classifyReplyIntent(utterance, session.tutor.awaitingAnswer);
     const dialogueAct = dialogueActForUtterance(utterance, session.tutor.awaitingAnswer);
-    if (replyIntent === "CLOSING") session.tutor.awaitingAnswer = false;
+    // Leaving with questions still open: give the answers rather than leave them hanging.
+    let closingReveal = "";
+    if (replyIntent === "CLOSING" && session.tutor.awaitingAnswer) {
+      closingReveal = revealOpenAnswers(session.tutor.quiz);
+      setQuiz(session, []);
+    }
     let action = decideAction({
       utterance,
       awaitingAnswer: session.tutor.awaitingAnswer,
@@ -561,6 +576,8 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     });
     let ragFollowup: NestFollowupIntent | string = followup;
     if (action === "SIMPLIFY" || replyIntent === "DONT_KNOW") ragFollowup = "simplify";
+    /** SymPy answer FastAPI computed for a check question its reply ended on. */
+    let checkExpected = "";
 
     // Owned by this turn: interruptSession swaps in a fresh controller, so the
     // captured signal is the only way to tell "my work was cancelled" apart
@@ -626,6 +643,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         // LLM-first: closing / ack / intro — skip rewriter + chapter RAG.
         // Not used while EVALUATE is active ("yes" must still be graded).
         action = "ANSWER";
+        if (closingReveal) this.streamSay(live, session, speech, closingReveal);
         const rag = await this.streamRag({
           session,
           live,
@@ -640,28 +658,38 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         ragMs = rag.ms;
         retrievedIds = rag.retrievedIds;
         pages = rag.pages;
-        reply = rag.answer;
+        reply = `${closingReveal} ${rag.answer}`.trim();
         if (rag.voiceMeta) this.applyVoiceMeta(session, rag.voiceMeta, live);
+        checkExpected = rag.voiceMeta?.quiz_expected || "";
         if (!reply) reply = MSG.didntCatch;
+      } else if (action === "START_QUIZ") {
+        // Questions come from this session's transcript only — no chapter retrieval,
+        // so no unrelated figures and no out-of-context questions.
+        const quiz = await this.questions.quizFromSession(history, session.summary, session.figures);
+        if (!quiz.length) {
+          action = "ANSWER";
+          reply = MSG.quizNothingYet;
+        } else {
+          setQuiz(session, quiz);
+          session.tutor.turnsSinceCheck = 0;
+          action = "ASK_QUESTION";
+          reply = quizIntro(quiz);
+          const figs = quiz.flatMap((q) => (q.figure ? [q.figure] : []));
+          if (live && figs.length) live.emit("related_images", { images: figs, turnId });
+          live?.emit("question_generated", { question: quiz[0].question, count: quiz.length });
+        }
       } else if (action === "EVALUATE") {
-        grade = await this.evaluator.grade(
-          session.tutor.expectedAnswer,
-          utterance,
-          session.tutor.currentConcept,
-        );
-        const follow = afterEvaluate(grade);
-        action = follow;
-        const prefix =
-          grade === "CORRECT"
-            ? MSG.correct
-            : grade === "PARTIALLY_CORRECT"
-              ? MSG.partial
-              : grade === "INCORRECT"
-                ? MSG.incorrect
-                : MSG.uncertain;
-        session.tutor.awaitingAnswer = false;
-        if (grade === "CORRECT") session.tutor.consecutiveCorrect += 1;
-        if (grade === "INCORRECT") session.tutor.consecutiveIncorrect += 1;
+        const open = openQuizIndexes(session.tutor.quiz);
+        const grades =
+          replyIntent === "DONT_KNOW"
+            ? [{ index: open[0], grade: "INCORRECT" as AnswerGrade }]
+            : await this.evaluator.gradeQuiz(session.tutor.quiz, open, utterance);
+        const result = applyQuizGrades(session.tutor.quiz, grades);
+        setQuiz(session, result.quiz);
+        for (const o of result.outcomes) {
+          if (o.grade === "CORRECT") session.tutor.consecutiveCorrect += 1;
+          if (o.grade === "INCORRECT") session.tutor.consecutiveIncorrect += 1;
+        }
         const next = nextDifficulty({
           difficulty: session.tutor.difficulty,
           consecutiveCorrect: session.tutor.consecutiveCorrect,
@@ -671,45 +699,41 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         session.tutor.difficulty = next.difficulty;
         session.tutor.consecutiveCorrect = next.consecutiveCorrect;
         session.tutor.consecutiveIncorrect = next.consecutiveIncorrect;
-        void this.progress.recordGrade({
-          studentId: session.studentId,
-          classLevel: session.scope.classLevel,
-          subject: session.scope.subject,
-          chapter: session.scope.chapterNames[0] || "",
-          topic: session.tutor.currentConcept,
-          grade,
-          difficulty: session.tutor.difficulty,
-          sessionId,
-        });
-        live?.emit("answer_evaluated", { grade, action, difficulty: session.tutor.difficulty });
-        // The verdict is known before retrieval runs, so say it now — the
-        // student hears "Exactly!" while the explanation is still being fetched.
-        this.streamSay(live, session, speech, prefix);
-        const rag = await this.streamRag({
-          session,
-          live,
-          speech,
-          signal,
-          // Canonical student message — never the retrieval rewrite.
-          query: utterance,
-          guardNotFound: false,
-          followup: ragFollowup,
-          imageIds: opts.imageIds,
-        });
-        ragMs = rag.ms;
-        retrievedIds = rag.retrievedIds;
-        pages = rag.pages;
-        reply = `${prefix} ${rag.answer}`.trim();
-        if (rag.voiceMeta) this.applyVoiceMeta(session, rag.voiceMeta, live);
-        if (grade === "CORRECT" && next.difficulty > session.tutor.difficulty - 1) {
-          tail = "Now let's try something slightly harder.";
-          reply += ` ${tail}`;
+        grade = result.outcomes[0]?.grade;
+        action = result.next < 0 ? "CONTINUE_LESSON" : grade === "CORRECT" ? "ASK_QUESTION" : "GIVE_HINT";
+        for (const o of result.outcomes) {
+          void this.progress.recordGrade({
+            studentId: session.studentId,
+            classLevel: session.scope.classLevel,
+            subject: session.scope.subject,
+            chapter: session.scope.chapterNames[0] || "",
+            topic: result.quiz[o.index].question,
+            grade: o.grade,
+            difficulty: session.tutor.difficulty,
+            sessionId,
+          });
         }
+        live?.emit("answer_evaluated", { grade, action, difficulty: session.tutor.difficulty });
+        // A hint has to point at something on screen: re-show the figure it refers to.
+        const figs = result.outcomes.flatMap((o) => {
+          const f = result.quiz[o.index].figure;
+          return f && !result.quiz[o.index].done ? [f] : [];
+        });
+        if (live && figs.length) live.emit("related_images", { images: figs, turnId });
+        // Grounded on the fixed verdicts only — no chapter retrieval to reinterpret the answer.
+        reply = await this.evaluator.quizFeedback({
+          quiz: result.quiz,
+          outcomes: result.outcomes,
+          next: result.next,
+          student: utterance,
+          classLevel: session.scope.classLevel,
+        });
       } else if (action === "OUT_OF_SCOPE") {
         reply = MSG.outOfScope(session.scope.classLevel, session.scope.subject);
       } else {
-        // New question / refusal while a check was open — drop the quiz latch.
-        if (session.tutor.awaitingAnswer) session.tutor.awaitingAnswer = false;
+        // A multi-question quiz survives a side question; a single check-in or a refusal drops it.
+        const keepQuiz = session.tutor.awaitingAnswer && session.tutor.quiz.length > 1 && action !== "ANSWER";
+        if (session.tutor.awaitingAnswer && !keepQuiz) setQuiz(session, []);
         const rag = await this.streamRag({
           session,
           live,
@@ -725,6 +749,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         pages = rag.pages;
         reply = rag.answer;
         if (rag.voiceMeta) this.applyVoiceMeta(session, rag.voiceMeta, live);
+        checkExpected = rag.voiceMeta?.quiz_expected || "";
         if (!reply) reply = MSG.notInTextbook;
         // Only swap in the canned refusal while nothing has been spoken yet.
         // Once sentences are on the wire, rewriting `reply` would leave the
@@ -739,8 +764,12 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         session.currentTopic = session.tutor.currentConcept;
         if (followup === "simplify") action = "SIMPLIFY";
         if (followup === "example") action = "PROVIDE_EXAMPLE";
-        if (followup === "quiz") action = "START_QUIZ";
         if (replyIntent === "DONT_KNOW") action = "SIMPLIFY";
+        if (keepQuiz) {
+          const left = openQuizIndexes(session.tutor.quiz);
+          tail = `We still have question ${left[0] + 1} left: ${session.tutor.quiz[left[0]].question}`;
+          reply = `${reply} ${tail}`;
+        }
       }
 
       session.tutor.turnsSinceCheck += 1;
@@ -753,7 +782,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       const scriptedQuiz =
         !skipScriptedQuiz &&
         !config.naturalCheckins &&
-        (action === "START_QUIZ" || afterExplainShouldCheck(session.tutor, reply, action));
+        afterExplainShouldCheck(session.tutor, reply, action);
       if (scriptedQuiz) {
         const q = await this.questions.fromTextbook(
           session.tutor.currentConcept || session.scope.subject,
@@ -763,11 +792,22 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         const check = `Can I ask you a quick question to check your understanding? ${q.question}`;
         tail = tail ? `${tail} ${check}` : check;
         reply = `${reply.replace(/\?+$/, "")} ${check}`;
-        session.tutor.awaitingAnswer = true;
-        session.tutor.expectedAnswer = q.expected;
+        setQuiz(session, [{ question: q.question, expected: q.expected, attempts: 0, done: false }]);
         session.tutor.turnsSinceCheck = 0;
         action = "ASK_QUESTION";
         live?.emit("question_generated", { question: q.question });
+      } else if (
+        !session.tutor.awaitingAnswer &&
+        replyIntent !== "CLOSING" &&
+        !["OUT_OF_SCOPE", "RECALL", "CONTINUE_LESSON"].includes(action)
+      ) {
+        // The LLM often asks its own check-in ("what would 2^4 be? Just guess!") —
+        // track it so the next reply is graded instead of treated as a new question.
+        const question = pendingQuestion(reply);
+        if (question) {
+          setQuiz(session, [{ question, expected: checkExpected, attempts: 0, done: false }]);
+          session.tutor.turnsSinceCheck = 0;
+        }
       }
 
       session.tutor.action = action;
@@ -1231,6 +1271,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       const result = await this.safeRag(ask, live);
       const l = opts.live;
       if (l && result.images.length && turnStillActive(signal, speech.turnId, l.turnId)) {
+        rememberFigures(session, result.images);
         const images = freshImages(l, result.images);
         if (images.length) l.emit("related_images", { images, turnId: speech.turnId });
       }
@@ -1268,6 +1309,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
           // An answer the student already heard keeps its figures even after a barge-in;
           // they attach to that turn's line on the client, so they can't bleed into the next one.
           if (speech.dispatched === 0 && !turnStillActive(signal, speech.turnId, live.turnId)) return;
+          rememberFigures(session, images);
           const fresh = freshImages(live, images);
           if (fresh.length) live.emit("related_images", { images: fresh, turnId: speech.turnId });
         },
@@ -1534,6 +1576,39 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
 
 /** Lesson words for Whisper's initial prompt — biases decoding toward the chapter's vocabulary. */
 /** Drops figures this connection already showed and marks the rest as shown. */
+/** Replace the open quiz and keep the FastAPI-facing fields in step with it. */
+export function setQuiz(session: VoiceSession, quiz: QuizItem[]): void {
+  session.tutor.quiz = quiz;
+  const next = quiz.find((q) => !q.done);
+  session.tutor.awaitingAnswer = !!next;
+  session.lastQuizQuestion = next?.question || "";
+  session.quizAttempts = next?.attempts || 0;
+}
+
+const MAX_SESSION_FIGURES = 10;
+
+function rememberFigures(session: VoiceSession, images: RagRelatedImage[]): void {
+  session.figures = mergeImages(session.figures ?? [], images).slice(-MAX_SESSION_FIGURES);
+}
+
+function figureLabel(f: RagRelatedImage): string {
+  return f.figure_number ? `Figure ${f.figure_number}` : "the figure";
+}
+
+export function quizIntro(quiz: QuizItem[]): string {
+  const ask = (q: QuizItem) => (q.figure ? `Look at ${figureLabel(q.figure)} on your screen. ${q.question}` : q.question);
+  if (quiz.length === 1) return `Here's a quick question on what we covered. ${ask(quiz[0])}`;
+  const items = quiz.map((q, i) => `Question ${i + 1}: ${ask(q)}`).join(" ");
+  return `Quick quiz on what we just covered: ${quiz.length} questions. Answer them one at a time or all together. ${items}`;
+}
+
+export function revealOpenAnswers(quiz: QuizItem[]): string {
+  const open = quiz.flatMap((q, i) => (!q.done && q.expected ? [{ q, i }] : []));
+  if (!open.length) return "";
+  if (quiz.length === 1) return `Before you go, the answer was ${open[0].q.expected}.`;
+  return `Before you go, the answers: ${open.map(({ q, i }) => `question ${i + 1}, ${q.expected}`).join("; ")}.`;
+}
+
 export function freshImages(live: { shownImages: Set<string> }, images: RagRelatedImage[]): RagRelatedImage[] {
   return images.filter((img) => {
     const key = img.url.split("?")[0];

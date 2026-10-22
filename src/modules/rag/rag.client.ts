@@ -76,6 +76,7 @@ type NdjsonEvent = {
   affect_hint?: string;
   affect_primary?: string;
   affect_trajectory?: string[];
+  quiz_expected?: string;
 };
 
 function normalizeRelatedImages(raw: unknown): RagRelatedImage[] {
@@ -194,6 +195,7 @@ export class RagClient {
           affect_hint: ev.affect_hint,
           affect_primary: ev.affect_primary,
           affect_trajectory: ev.affect_trajectory,
+          quiz_expected: ev.quiz_expected,
         };
       }
     };

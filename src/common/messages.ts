@@ -24,8 +24,7 @@ export const MSG = {
   sessionLost: "I lost track of our session. Tap Start Talking to continue.",
   /** Student reacted instead of answering — keep the open question alive. */
   questionStillOpen: "Take a shot at that question whenever you're ready.",
-  correct: "Exactly — nice work!",
-  partial: "You're on the right track — keep going.",
-  incorrect: "Not quite — let's look at it another way.",
-  uncertain: "I'm not sure I caught that — can you say it another way?",
+  /** Quiz asked for before anything was taught — quiz questions only come from this session. */
+  quizNothingYet:
+    "We haven't covered anything together yet. Ask me about a topic first, and then I'll quiz you on it.",
 };

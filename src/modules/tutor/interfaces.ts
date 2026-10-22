@@ -35,10 +35,23 @@ export type SessionScope = {
   chapter?: string;
 };
 
+export type QuizItem = {
+  question: string;
+  /** "" when unknown (tutor's own check-in on a non-math topic) — the grader judges from the question. */
+  expected: string;
+  figure?: RagRelatedImage;
+  attempts: number;
+  grade?: AnswerGrade;
+  done: boolean;
+  /** Answer was given away after two misses (or on closing) — not counted as correct. */
+  revealed?: boolean;
+};
+
 export type TutorSnapshot = {
   action: TutorAction;
+  /** True while any quiz item is still open. */
   awaitingAnswer: boolean;
-  expectedAnswer: string;
+  quiz: QuizItem[];
   currentConcept: string;
   difficulty: number;
   consecutiveCorrect: number;
@@ -63,6 +76,8 @@ export type RagVoiceMeta = {
   affect_hint?: string;
   affect_primary?: string;
   affect_trajectory?: string[];
+  /** SymPy answer to the check question the reply ended on (math only). */
+  quiz_expected?: string;
 };
 
 /** Textbook figure payload from FastAPI related_images events. */

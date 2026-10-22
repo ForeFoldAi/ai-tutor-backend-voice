@@ -5,7 +5,7 @@ export function defaultSnapshot(): TutorSnapshot {
   return {
     action: "ANSWER",
     awaitingAnswer: false,
-    expectedAnswer: "",
+    quiz: [],
     currentConcept: "",
     difficulty: 3,
     consecutiveCorrect: 0,
