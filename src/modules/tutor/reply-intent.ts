@@ -109,6 +109,28 @@ export function ackReply(utterance: string): string {
   return "Alright.";
 }
 
+/** Offers and tag questions — "yes" to these is not a quiz answer. */
+const OFFER_RE =
+  /^(?:(?:so|okay|ok|now|great|alright)[,!]?\s+)?(?:want|do\s+you\s+want|would\s+you\s+like|shall\s+(?:i|we)|should\s+(?:i|we)|can\s+i|may\s+i|ready|any\s+(?:other\s+|more\s+)?questions?|does\s+(?:that|this)\s+make\s+sense|got\s+it|right|okay|ok|isn'?t\s+it|na)\b/i;
+
+/**
+ * The check question a tutor reply leaves open, or "".
+ * Looks at the last two sentences — replies often end on "Just guess!" after the question.
+ * Keep in sync with pending_question() in ai-tutor-backend/app/services/voice_tutor.py.
+ */
+export function pendingQuestion(reply: string): string {
+  const sentences = (reply || "")
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(-2);
+  for (let i = sentences.length - 1; i >= 0; i--) {
+    const s = sentences[i];
+    if (s.includes("?") && !OFFER_RE.test(s)) return s;
+  }
+  return "";
+}
+
 export function classifyReplyIntent(utterance: string, quizPending: boolean): ReplyIntent {
   const q = (utterance || "").trim();
   if (!q || !/[a-zA-Z0-9]/.test(q)) return "UNCLEAR";

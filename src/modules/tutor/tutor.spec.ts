@@ -1,10 +1,18 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { rewriteRetrievalQuery, followupIntent, topicFromQuestion } from "./query-rewriter";
-import { gradeByOverlap } from "./answer-evaluator.service";
+import { gradeByOverlap, gradeNumeric, numbersIn } from "./answer-evaluator.service";
 import { nextDifficulty } from "./difficulty-manager.service";
 import { classifyReplyIntent } from "./reply-intent";
-import { afterEvaluate, afterExplainShouldCheck, decideAction, looksLikeNewQuestion } from "./tutor-orchestrator.service";
+import {
+  afterEvaluate,
+  afterExplainShouldCheck,
+  applyQuizGrades,
+  decideAction,
+  looksLikeNewQuestion,
+  openQuizIndexes,
+} from "./tutor-orchestrator.service";
+import type { QuizItem } from "./interfaces";
 import { defaultSnapshot } from "./tutor-state.service";
 import { turnStillActive } from "./turn-commit";
 import { isRecallQuestion } from "./query-rewriter";
@@ -123,21 +131,33 @@ describe("orchestrator", () => {
       "EXPLAIN",
     );
   });
-  it("does not evaluate I don't know while awaiting", () => {
+  it("I don't know uses up an attempt while awaiting", () => {
     assert.equal(
       decideAction({ utterance: "I don't know.", awaitingAnswer: true, turnsSinceCheck: 1 }),
-      "SIMPLIFY",
+      "EVALUATE",
     );
     assert.equal(classifyReplyIntent("I don't know.", true), "DONT_KNOW");
   });
-  it("does not evaluate confusion while awaiting", () => {
+  it("simplifies I don't know when nothing is open", () => {
     assert.equal(
-      decideAction({
-        utterance: "I didn't get what you're saying.",
-        awaitingAnswer: true,
-        turnsSinceCheck: 1,
-      }),
+      decideAction({ utterance: "I don't know.", awaitingAnswer: false, turnsSinceCheck: 1 }),
       "SIMPLIFY",
+    );
+  });
+  it("grades an answer phrased as a question", () => {
+    for (const u of ["Is it 9?", "maybe sixteen?", "16?", "I think it's 16"]) {
+      assert.equal(decideAction({ utterance: u, awaitingAnswer: true, turnsSinceCheck: 1 }), "EVALUATE", u);
+    }
+    assert.equal(
+      decideAction({ utterance: "What is 2 + 3?", awaitingAnswer: true, turnsSinceCheck: 1 }),
+      "EXPLAIN",
+    );
+  });
+  it("starts a quiz on conduct-a-quiz", () => {
+    assert.equal(followupIntent("Please, please conduct a quiz."), "quiz");
+    assert.equal(
+      decideAction({ utterance: "Please conduct a quiz", awaitingAnswer: false, turnsSinceCheck: 0 }),
+      "START_QUIZ",
     );
   });
   it("treats goodbye as answer not evaluate", () => {
@@ -169,6 +189,50 @@ describe("orchestrator", () => {
     assert.equal(looksLikeNewQuestion("What was my last question?"), true);
     assert.equal(looksLikeNewQuestion("What is photosynthesis?"), true);
     assert.equal(looksLikeNewQuestion("Sunlight and water"), false);
+  });
+});
+
+describe("quiz state", () => {
+  const quiz = (): QuizItem[] =>
+    ["Q1", "Q2", "Q3"].map((question) => ({ question, expected: "", attempts: 0, done: false }));
+
+  it("answering one question keeps the rest open", () => {
+    const r = applyQuizGrades(quiz(), [{ index: 0, grade: "CORRECT" }]);
+    assert.deepEqual(openQuizIndexes(r.quiz), [1, 2]);
+    assert.equal(r.next, 1);
+  });
+  it("answering all at once finishes the quiz", () => {
+    const r = applyQuizGrades(quiz(), [
+      { index: 0, grade: "CORRECT" },
+      { index: 1, grade: "CORRECT" },
+      { index: 2, grade: "CORRECT" },
+    ]);
+    assert.equal(r.next, -1);
+  });
+  it("a wrong answer stays open once, then is revealed", () => {
+    let r = applyQuizGrades(quiz(), [{ index: 1, grade: "INCORRECT" }]);
+    assert.equal(r.quiz[1].done, false);
+    assert.equal(r.outcomes[0].revealed, false);
+    r = applyQuizGrades(r.quiz, [{ index: 1, grade: "INCORRECT" }]);
+    assert.equal(r.quiz[1].done, true);
+    assert.equal(r.outcomes[0].revealed, true);
+    assert.equal(r.next, 0);
+  });
+});
+
+describe("numeric grading", () => {
+  it("2^4: 9 is wrong, sixteen is right", () => {
+    assert.equal(gradeNumeric("16", "is it 9"), "INCORRECT");
+    assert.equal(gradeNumeric("16", "sixteen"), "CORRECT");
+    assert.equal(gradeNumeric("16", "2 to the 4 is 16"), "CORRECT");
+  });
+  it("reads Indian grouping and spoken hundreds", () => {
+    assert.equal(gradeNumeric("1,728", "one thousand seven hundred and twenty eight"), "CORRECT");
+    assert.deepEqual(numbersIn("two hundred fifty six"), [256]);
+  });
+  it("leaves non-numeric answers to the LLM", () => {
+    assert.equal(gradeNumeric("x = -2 or x = 2", "2"), null);
+    assert.equal(gradeNumeric("photosynthesis", "sunlight"), null);
   });
 });
 

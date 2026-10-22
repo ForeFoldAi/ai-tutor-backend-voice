@@ -11,7 +11,21 @@ import {
   ackReply,
   isPersonalIntro,
   dialogueActForUtterance,
+  pendingQuestion,
 } from "./reply-intent";
+
+describe("pendingQuestion", () => {
+  it("finds the check question even when the reply ends on 'Just guess!'", () => {
+    assert.equal(
+      pendingQuestion("Got it! Want to try a quick check? If 2³ = 8, what would 2⁴ be? Just guess and I'll confirm!"),
+      "If 2³ = 8, what would 2⁴ be?",
+    );
+  });
+  it("ignores offers and plain statements", () => {
+    assert.equal(pendingQuestion("That's how powers work. Want me to show you step by step?"), "");
+    assert.equal(pendingQuestion("Plants make food using sunlight."), "");
+  });
+});
 
 describe("classifyReplyIntent", () => {
   it("detects closing", () => {
