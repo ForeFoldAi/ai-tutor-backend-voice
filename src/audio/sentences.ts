@@ -45,6 +45,8 @@ export function speakable(text: string): string {
       .replace(/(\b\w*\d\w*|[²³¹)]|\b[a-zA-Z]\b)[ \t]+-[ \t]+(?=\d|\b[a-zA-Z]\b|\()/g, "$1 minus ")
       .replace(/(?<=[\w²³¹)])[ \t]*\+[ \t]*(?=[\w(])/g, " plus ")
       .replace(/[ \t]*[×✕][ \t]*/g, " times ")
+      // `*` between maths terms is multiplication; the markup strip below would make `2*3*4` "234".
+      .replace(/(\d|[)²³]|\b[a-zA-Z]\b)[ \t]*\*(?!\*)[ \t]*(?=\d|\(|\b[a-zA-Z]\b)/g, "$1 times ")
       .replace(/[ \t]*÷[ \t]*/g, " divided by ")
       .replace(/[ \t]*=[ \t]*/g, " equals ")
       .replace(/√[ \t]*/g, " square root of ")

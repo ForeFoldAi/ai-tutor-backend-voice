@@ -103,6 +103,9 @@ describe("speakable", () => {
     assert.equal(speakable("Think of 549 as (550 – 1)."), "Think of 549 as (550 minus 1).");
     assert.equal(speakable("302,500 - 1,100 + 1 = 301,401"), "302,500 minus 1,100 plus 1 equals 301,401");
     assert.equal(speakable("2 × 550 × 1 = 1,100"), "2 times 550 times 1 equals 1,100");
+    // Live voice: "(3 + 4)² = 3² + 2*3*4 + 4²" was spoken as "two hundred thirty-four".
+    assert.equal(speakable("2*3*4 = 24"), "2 times 3 times 4 equals 24");
+    assert.equal(speakable("2 * a * b"), "2 times a times b");
     assert.equal(speakable("√144 = 12 and 12 ÷ 4 = 3"), "square root of 144 equals 12 and 12 divided by 4 equals 3");
     // A prose dash is a pause, not "minus".
     assert.equal(speakable("Science starts with curiosity – just like you."), "Science starts with curiosity – just like you.");
