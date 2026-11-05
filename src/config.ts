@@ -50,7 +50,7 @@ export const config = {
   tutorApiUrl: env("TUTOR_API_URL", "http://127.0.0.1:8000").replace(/\/$/, ""),
   llmBaseUrl: env("LLM_BASE_URL", "https://api.mistral.ai/v1").replace(/\/$/, ""),
   llmApiKey: env("LLM_API_KEY") || env("MISTRAL_API_KEY"),
-  llmModel: env("LLM_MODEL", "mistral-small-latest"),
+  llmModel: env("LLM_MODEL", "ministral-8b-latest"),
   /** Orchestration LLM calls (grade, quiz, recall, summary). */
   llmTimeoutMs: envInt("LLM_TIMEOUT_MS", 10000),
   /** FastAPI RAG: max wait for the response to start (headers), and for each stream chunk after. */
