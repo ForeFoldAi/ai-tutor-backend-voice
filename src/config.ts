@@ -83,7 +83,7 @@ export const config = {
   /** Shared secret with FastAPI VOICE_INTERNAL_TOKEN — STT/TTS without a student JWT. */
   voiceInternalToken: env("VOICE_INTERNAL_TOKEN"),
   /** Short cached "let me think" audio played while a slow turn is still working. */
-  thinkingFiller: envBool("VOICE_THINKING_FILLER", true),
+  thinkingFiller: envBool("VOICE_THINKING_FILLER", false),
   fillerDelayMs: envInt("VOICE_FILLER_DELAY_MS", 700),
   fillerMaxDurationMs: envInt("VOICE_FILLER_MAX_DURATION_MS", 2500),
   fillerMaxPerSession: envInt("VOICE_FILLER_MAX_PER_SESSION", 20),

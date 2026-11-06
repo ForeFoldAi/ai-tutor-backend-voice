@@ -27,10 +27,18 @@ export const CHUNK_MAX_CHARS = 320;
 export function speakable(text: string): string {
   return (
     text
+      // Source labels the student should never hear ("Beyond your textbook: …").
+      .replace(/\b(?:beyond (?:your|the) textbook|beyond this chapter|additional context)\s*(?:\.\.\.|…|[:,—–-])\s*/gi, "")
       .replace(/```[\s\S]*?```/g, " ")
       .replace(/`([^`]*)`/g, "$1")
       .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
       .replace(/\$\$?([^$]*?)\$\$?/g, "$1")
+      // Fractions are read the Indian classroom way: "p by q", "1 by 2". Edge skips a bare
+      // "/" ("p q"), and stripping \frac below would leave "p q" too.
+      .replace(/\\[dt]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, " $1 by $2 ")
+      .replace(/\b(km|m|cm)[ \t]*\/[ \t]*(h|hr|s|sec)\b/gi, (_m, d: string, t: string) =>
+        `${d} per ${/^h/i.test(t) ? "hour" : "second"}`)
+      .replace(/(\)|(?<![/\w.])(?:\d+(?:\.\d+)?|[a-zA-Z]))[ \t]*\/[ \t]*(?=\d|\b[a-zA-Z]\b|\()/g, "$1 by ")
       .replace(/\\[a-zA-Z]+\s?/g, " ")
       .replace(/\^2\b/g, " squared")
       .replace(/\^3\b/g, " cubed")
@@ -48,6 +56,9 @@ export function speakable(text: string): string {
       // `*` between maths terms is multiplication; the markup strip below would make `2*3*4` "234".
       .replace(/(\d|[)²³]|\b[a-zA-Z]\b)[ \t]*\*(?!\*)[ \t]*(?=\d|\(|\b[a-zA-Z]\b)/g, "$1 times ")
       .replace(/[ \t]*÷[ \t]*/g, " divided by ")
+      .replace(/[ \t]*≠[ \t]*/g, " is not equal to ")
+      .replace(/[ \t]*≤[ \t]*/g, " is less than or equal to ")
+      .replace(/[ \t]*≥[ \t]*/g, " is greater than or equal to ")
       .replace(/[ \t]*=[ \t]*/g, " equals ")
       .replace(/√[ \t]*/g, " square root of ")
       .replace(/∛[ \t]*/g, " cube root of ")

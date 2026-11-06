@@ -150,3 +150,17 @@ describe("step-by-step answers", () => {
     }
   });
 });
+
+describe("speakable fractions and labels", () => {
+  it("reads fractions as 'by'", () => {
+    assert.equal(speakable("A rational number is p/q."), "A rational number is p by q.");
+    assert.equal(speakable("Half is 1/2."), "Half is 1 by 2.");
+    assert.equal(speakable("$\\frac{3}{4}$ of it"), "3 by 4 of it");
+    assert.equal(speakable("60 km/h"), "60 km per hour");
+    assert.equal(speakable("and/or"), "and/or");
+  });
+
+  it("never speaks source labels", () => {
+    assert.equal(speakable("Beyond your textbook: carbon forms four bonds."), "carbon forms four bonds.");
+  });
+});
