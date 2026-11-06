@@ -1343,8 +1343,14 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     streaming: boolean,
     said: string,
   ): RagResult {
+    // The answer was already spoken and only the post-answer work (panel, figures) failed:
+    // the student has a complete reply, so an apology tacked on the end is just noise.
+    if (said.trim()) {
+      this.log.warn("rag stream ended early after the answer was spoken; keeping the answer");
+      return { answer: said.trim(), retrievedIds: [], pages: [], images: [], ms: 0 };
+    }
     if (streaming) this.streamSay(live, session, speech, MSG.ragFail);
-    return { answer: `${said} ${MSG.ragFail}`.trim(), retrievedIds: [], pages: [], images: [], ms: 0 };
+    return { answer: MSG.ragFail, retrievedIds: [], pages: [], images: [], ms: 0 };
   }
 
   private emitAuthExpired(live: Live | undefined): void {
