@@ -19,4 +19,14 @@ describe("SileroVad", () => {
     assert.deepEqual(await vad.push(pcm(SILERO_WINDOW), 20), ["speech"]);
     assert.deepEqual(await vad.push(pcm(SILERO_WINDOW), 80), ["stop"]);
   });
+
+  it("reports voiced length without the hang", async () => {
+    let p = 0.9;
+    const vad = new SileroVad({ hangMs: 50, infer: async (_frame, state) => ({ p, state }) });
+    await vad.push(pcm(SILERO_WINDOW * 3), 0);
+    p = 0.1;
+    await vad.push(pcm(SILERO_WINDOW * 4), 20);
+    assert.deepEqual(await vad.push(pcm(SILERO_WINDOW), 80), ["stop"]);
+    assert.equal(vad.lastVoicedMs, 96);
+  });
 });

@@ -93,6 +93,7 @@ export function dialogueActForUtterance(
   const q = (utterance || "").trim();
   if (!q) return null;
   if (CLOSING_RE.test(q)) return "closing";
+  if (isTeachRequest(q)) return null;
   if (isPersonalIntro(q)) return "intro";
   if (!quizPending && isBareAcknowledgement(q)) return "ack";
   if (quizPending && isBareAcknowledgement(q)) return "ack";
@@ -114,6 +115,45 @@ const OFFER_RE =
   /^(?:(?:so|okay|ok|now|great|alright)[,!]?\s+)?(?:want|do\s+you\s+want|would\s+you\s+like|shall\s+(?:i|we)|should\s+(?:i|we)|can\s+i|may\s+i|ready|any\s+(?:other\s+|more\s+)?questions?|does\s+(?:that|this)\s+make\s+sense|got\s+it|right|okay|ok|isn'?t\s+it|na)\b/i;
 
 /**
+ * Questions about the student, not about the lesson: a reply to these is a new
+ * request, and grading it produced "not quite yet, have another go" for "What
+ * is Vijayanagar?". Includes the "did you mean X?" mishearing check.
+ */
+const NON_CHECK_RE = new RegExp(
+  [
+    String.raw`\bdid\s+you\s+(?:mean|say)\b`,
+    String.raw`\b(?:what|which)\s+(?:part|topic|bit|area|one)s?\b.*\b(?:tricky|confus|stuck|interest|explore|like|want|start|feel|hard|difficult|next)`,
+    String.raw`^(?:so|okay|ok|now|great|alright)?[,!]?\s*(?:does|did|is|was)\s+(?:that|this|it)\s+(?:help|give|make|clear|clarify|answer|sound|feel|work)`,
+    String.raw`^(?:do|did|can|could)\s+you\s+(?:see|picture|imagine|follow|understand|get)\s+(?:it|that|this|them|now)\b`,
+    String.raw`^do\s+you\s+(?:want|need)\b`,
+    String.raw`\b(?:what|anything)\s+else\b`,
+    String.raw`\bwhat\s+would\s+you\s+like\b`,
+    String.raw`\b(?:or|shall\s+we|want\s+to)\s+(?:move|go|try|continue|look)\b`,
+    String.raw`\bhow\s+(?:about|does\s+that\s+sound)\b`,
+    String.raw`\bany\s+(?:other\s+|more\s+)?(?:doubts?|questions?)\b`,
+    // Choices ("Which of these four forms do you want to explore first?") have no right answer.
+    String.raw`\b(?:do|would)\s+you\s+(?:want|like|prefer|wish)\b`,
+    String.raw`\b(?:shall|should)\s+(?:we|i)\b`,
+    String.raw`\b(?:explore|learn|cover|discuss|start\s+with|begin\s+with|look\s+at)\s+(?:first|next)\b`,
+  ].join("|"),
+  "i",
+);
+
+/**
+ * Requests to be taught ("keep teaching me this lesson") and protests about a
+ * misheard turn ("I did not say anything") — never answers to an open check question.
+ */
+const TEACH_REQUEST_RE =
+  /\b(?:teach(?:ing)?\s+(?:me|us|this|the|it)|keep\s+(?:on\s+)?(?:teaching|going|explaining)|continue\s+(?:with\s+)?(?:the\s+|this\s+)?(?:lesson|teaching|explaining|explanation|chapter|topic)|(?:start|begin|resume)\s+(?:the\s+|this\s+)?(?:lesson|chapter|teaching|topic)|(?:explain|tell\s+me\s+about)\s+(?:the|this)\s+(?:lesson|chapter|topic)|(?:move|go)\s+on|next\s+(?:topic|part|point|section))\b/i;
+const NOT_AN_ANSWER_RE =
+  /\b(?:i\s+(?:did\s*n[o']?t|didn'?t|have\s*n[o']?t|haven'?t|never)\s+(?:say|said|ask|asked|answer|answered|speak|spoke)|(?:that'?s|that\s+is)\s+not\s+what\s+i\s+(?:said|asked))\b/i;
+
+export function isTeachRequest(utterance: string): boolean {
+  const q = (utterance || "").trim();
+  return TEACH_REQUEST_RE.test(q) || NOT_AN_ANSWER_RE.test(q);
+}
+
+/**
  * The check question a tutor reply leaves open, or "".
  * Looks at the last two sentences — replies often end on "Just guess!" after the question.
  * Keep in sync with pending_question() in ai-tutor-backend/app/services/voice_tutor.py.
@@ -126,7 +166,7 @@ export function pendingQuestion(reply: string): string {
     .slice(-2);
   for (let i = sentences.length - 1; i >= 0; i--) {
     const s = sentences[i];
-    if (s.includes("?") && !OFFER_RE.test(s)) return s;
+    if (s.includes("?") && !OFFER_RE.test(s) && !NON_CHECK_RE.test(s)) return s;
   }
   return "";
 }
@@ -136,6 +176,7 @@ export function classifyReplyIntent(utterance: string, quizPending: boolean): Re
   if (!q || !/[a-zA-Z0-9]/.test(q)) return "UNCLEAR";
   if (CLOSING_RE.test(q)) return "CLOSING";
   if (CONFUSION_RE.test(q)) return "DONT_KNOW";
+  if (isTeachRequest(q)) return "NEW_QUESTION";
   if (quizPending && !AFFIRM_RE.test(q)) {
     return isBareAcknowledgement(q) ? "UNCLEAR" : "WRONG_ANSWER";
   }

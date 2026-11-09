@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { rewriteRetrievalQuery, followupIntent, topicFromQuestion } from "./query-rewriter";
-import { gradeByOverlap, gradeNumeric, numbersIn } from "./answer-evaluator.service";
+import { AnswerEvaluatorService, gradeByOverlap, gradeNumeric, numbersIn } from "./answer-evaluator.service";
 import { nextDifficulty } from "./difficulty-manager.service";
 import { classifyReplyIntent } from "./reply-intent";
 import {
@@ -137,6 +137,35 @@ describe("orchestrator", () => {
       "EVALUATE",
     );
     assert.equal(classifyReplyIntent("I don't know.", true), "DONT_KNOW");
+  });
+  it("teaches instead of grading when the student asks to be taught", () => {
+    for (const u of ["I am fine. Keep teaching me this lesson.", "I did not say anything yet."]) {
+      assert.equal(decideAction({ utterance: u, awaitingAnswer: true, turnsSinceCheck: 1 }), "EXPLAIN", u);
+    }
+  });
+  it("never invents an answer when no answer key is stored", async () => {
+    const prompts: string[] = [];
+    const llm = {
+      complete: async (msgs: { content: string }[]) => {
+        prompts.push(msgs.map((m) => m.content).join("\n"));
+        throw new Error("rate limited");
+      },
+    };
+    const evaluator = new AnswerEvaluatorService(llm as never);
+    const quiz: QuizItem[] = [
+      { question: "What does vertical division mean?", expected: "", attempts: 2, done: true, revealed: true },
+    ];
+    const reply = await evaluator.quizFeedback({
+      quiz,
+      outcomes: [{ index: 0, grade: "INCORRECT", revealed: true }],
+      next: -1,
+      student: "no idea",
+      classLevel: "Class 10",
+      lesson: "Power is shared between different levels of government.",
+    });
+    assert.equal(reply, "Not quite. Let's go over it together.");
+    assert.match(prompts[0], /Tutor's last explanation: "Power is shared/);
+    assert.match(prompts[0], /do not name any answer/);
   });
   it("simplifies I don't know when nothing is open", () => {
     assert.equal(

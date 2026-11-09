@@ -49,6 +49,8 @@ export class SileroVad {
   private state = new Float32Array(STATE_LEN);
   private speaking = false;
   private lastVoiceAt = 0;
+  private voicedFrames = 0;
+  private endedVoicedFrames = 0;
   private infer: SileroInfer | null;
   private readonly hangMs: number;
 
@@ -59,6 +61,14 @@ export class SileroVad {
 
   get active(): boolean {
     return this.speaking;
+  }
+
+  /**
+   * Voiced audio (frames above the start threshold) in the segment that last
+   * stopped. Hang frames don't count, so a click plus 1.5 s of hang is ~32 ms.
+   */
+  get lastVoicedMs(): number {
+    return (this.endedVoicedFrames * SILERO_WINDOW * 1000) / PCM_SAMPLE_RATE;
   }
 
   async ready(): Promise<void> {
@@ -92,11 +102,14 @@ export class SileroVad {
     this.state = new Float32Array(STATE_LEN);
     this.speaking = false;
     this.lastVoiceAt = 0;
+    this.voicedFrames = 0;
+    this.endedVoicedFrames = 0;
   }
 
   private step(p: number, now: number): VadEvent {
     if (p >= START_P) {
       const started = !this.speaking;
+      this.voicedFrames = started ? 1 : this.voicedFrames + 1;
       this.speaking = true;
       this.lastVoiceAt = now;
       return started ? "start" : "speech";
@@ -105,6 +118,7 @@ export class SileroVad {
       if (p >= END_P) this.lastVoiceAt = now;
       if (now - this.lastVoiceAt >= this.hangMs) {
         this.speaking = false;
+        this.endedVoicedFrames = this.voicedFrames;
         return "stop";
       }
       return "speech";

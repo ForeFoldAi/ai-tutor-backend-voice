@@ -2,9 +2,11 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   isLikelyEcho,
+  isLowConfidenceShort,
   isMeaningfulTranscript,
   pcmSpeechRms,
   postprocessTranscript,
+  stripLeadIn,
   trimTrailingHang,
 } from "./stt-quality";
 
@@ -72,5 +74,17 @@ describe("meaningful transcript", () => {
       "A political map shows who rules which land. Look at the map on page 4.";
     assert.equal(isLikelyEcho("Look at the map on page 4", last), true);
     assert.equal(isLikelyEcho("What is India's political map?", last), false);
+  });
+  it("drops short transcripts whisper was unsure of", () => {
+    assert.equal(isLowConfidenceShort("Thank you.", -0.9, -0.75), true);
+    assert.equal(isLowConfidenceShort("Thank you.", -0.2, -0.75), false);
+    assert.equal(isLowConfidenceShort("What is the political map of India?", -0.9, -0.75), false);
+    assert.equal(isLowConfidenceShort("Six", undefined, -0.75), false);
+  });
+  it("strips spoken hesitation before a question", () => {
+    assert.equal(stripLeadIn("So what is political map?"), "What is political map?");
+    assert.equal(stripLeadIn("Um, uh, what is a map?"), "What is a map?");
+    assert.equal(stripLeadIn("So the Mughals were strong"), "So the Mughals were strong");
+    assert.equal(stripLeadIn("Um"), "Um");
   });
 });

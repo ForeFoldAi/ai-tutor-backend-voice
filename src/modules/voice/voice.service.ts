@@ -44,9 +44,11 @@ import {
 } from "./transcript-events";
 import {
   isLikelyEcho,
+  isLowConfidenceShort,
   isMeaningfulTranscript,
   pcmSpeechRms,
   postprocessTranscript,
+  stripLeadIn,
   trimTrailingHang,
 } from "./stt-quality";
 import { WhisperSttProvider } from "./providers/whisper.stt";
@@ -109,6 +111,8 @@ type Live = {
   pendingAt: number;
   /** Bumped per dispatched/merged utterance so a superseded one is dropped after STT. */
   utterGen: number;
+  /** Current capture continues an already-accepted utterance, so its own voiced length doesn't gate it. */
+  merged: boolean;
 };
 
 /**
@@ -280,6 +284,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       pendingPcm: null,
       pendingAt: 0,
       utterGen: 0,
+      merged: false,
     };
     this.live.set(sessionId, live);
     void this.memory.get(sessionId).then((s) => {
@@ -361,6 +366,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         // Student was only pausing — drop the half-question turn and answer both halves as one.
         live.chunks = [live.pendingPcm, samples];
         live.pendingPcm = null;
+        live.merged = true;
         live.utterGen += 1;
         live.abort.abort();
         live.abort = new AbortController();
@@ -391,7 +397,11 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     live.emit("student_stopped_speaking");
     const merged = trimTrailingHang(concat(live.chunks), config.vadHangMs, 300, PCM_SAMPLE_RATE);
     live.chunks = [];
-    if (Date.now() - live.lastSpokeAt < config.sttPostPlaybackMs) {
+    const continuation = live.merged;
+    live.merged = false;
+    const tooBrief = !continuation && live.vad.lastVoicedMs < config.sttMinVoicedMs;
+    if (tooBrief || Date.now() - live.lastSpokeAt < config.sttPostPlaybackMs) {
+      if (tooBrief) voiceLog("utterance_dropped", { sessionId: live.sessionId, voicedMs: live.vad.lastVoicedMs });
       live.vad.reset();
       // Client left PROCESSING after student_stopped — release it; no LLM turn.
       live.emit("ai_stopped_processing");
@@ -438,6 +448,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       live.chunks = [];
       live.preroll = [];
       live.pendingPcm = null;
+      live.merged = false;
       live.vad.reset();
       live.lastSpokeAt = Date.now();
     }
@@ -492,12 +503,13 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     }
 
     let text = "";
+    let confidence: number | undefined;
     try {
-      text = await this.stt.transcribe(pcm, {
+      ({ text, confidence } = await this.stt.transcribe(pcm, {
         token: session.accessToken,
         subject: session.scope.subject,
         prompt: sttPrompt(session),
-      });
+      }));
     } catch (err) {
       this.log.warn(`stt ${err}`);
       if (superseded()) return;
@@ -506,11 +518,13 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     }
     voiceLog("stt", { sessionId, studentId: session.studentId, sttMs: Date.now() - t0 });
     if (superseded()) return;
-    text = postprocessTranscript(text, session.scope.subject);
+    text = stripLeadIn(postprocessTranscript(text, session.scope.subject));
     const lastAssistant = [...(session.recentMessages || [])]
       .reverse()
       .find((t) => t.role === "assistant")?.content || "";
-    if (!text || !isMeaningfulTranscript(text) || isLikelyEcho(text, lastAssistant)) {
+    const unsure = isLowConfidenceShort(text, confidence, config.sttMinShortConfidence);
+    if (unsure) voiceLog("utterance_dropped", { sessionId, sttConfidence: confidence });
+    if (!text || unsure || !isMeaningfulTranscript(text) || isLikelyEcho(text, lastAssistant)) {
       session.state = "LISTENING";
       await this.memory.save(session);
       live?.emit("ai_stopped_processing");
@@ -727,6 +741,11 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
           next: result.next,
           student: utterance,
           classLevel: session.scope.classLevel,
+          lesson: history
+            .filter((t) => t.role === "assistant")
+            .slice(-2)
+            .map((t) => t.content)
+            .join(" "),
         });
       } else if (action === "OUT_OF_SCOPE") {
         reply = MSG.outOfScope(session.scope.classLevel, session.scope.subject);
@@ -1272,7 +1291,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       const l = opts.live;
       if (l && result.images.length && turnStillActive(signal, speech.turnId, l.turnId)) {
         rememberFigures(session, result.images);
-        const images = freshImages(l, result.images);
+        const images = freshImages(l, result.images, asksForFigure(query));
         if (images.length) l.emit("related_images", { images, turnId: speech.turnId });
       }
       return result;
@@ -1310,7 +1329,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
           // they attach to that turn's line on the client, so they can't bleed into the next one.
           if (speech.dispatched === 0 && !turnStillActive(signal, speech.turnId, live.turnId)) return;
           rememberFigures(session, images);
-          const fresh = freshImages(live, images);
+          const fresh = freshImages(live, images, asksForFigure(query));
           if (fresh.length) live.emit("related_images", { images: fresh, turnId: speech.turnId });
         },
       });
@@ -1615,10 +1634,22 @@ export function revealOpenAnswers(quiz: QuizItem[]): string {
   return `Before you go, the answers: ${open.map(({ q, i }) => `question ${i + 1}, ${q.expected}`).join("; ")}.`;
 }
 
-export function freshImages(live: { shownImages: Set<string> }, images: RagRelatedImage[]): RagRelatedImage[] {
+/** "Show me figure 2.12", "can I see the map" — the student wants it on screen even if it was shown before. */
+const FIGURE_ASK_RE =
+  /\bfig(?:ure)?\.?\s*(?:\d|one|two|three|four|five|six|seven|eight|nine|ten)|\b(?:show|get|see|display|open|bring|fetch|generate)\b.{0,40}\b(?:images?|pictures?|figures?|diagrams?|maps?|illustrations?)\b/i;
+
+export function asksForFigure(utterance: string): boolean {
+  return FIGURE_ASK_RE.test(utterance || "");
+}
+
+export function freshImages(
+  live: { shownImages: Set<string> },
+  images: RagRelatedImage[],
+  force = false,
+): RagRelatedImage[] {
   return images.filter((img) => {
     const key = img.url.split("?")[0];
-    if (live.shownImages.has(key)) return false;
+    if (live.shownImages.has(key) && !force) return false;
     live.shownImages.add(key);
     return true;
   });

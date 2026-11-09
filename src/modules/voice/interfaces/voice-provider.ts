@@ -14,9 +14,15 @@ export type SttHints = {
   prompt?: string;
 };
 
+export type SttResult = {
+  text: string;
+  /** Mean Whisper avg_logprob (0 is certain, below -1 is a guess); undefined when not reported. */
+  confidence?: number;
+};
+
 export interface ISTTProvider {
   /** Mono 16 kHz PCM. */
-  transcribe(pcm: Int16Array, hints?: SttHints): Promise<string>;
+  transcribe(pcm: Int16Array, hints?: SttHints): Promise<SttResult>;
 }
 
 export interface ITTSProvider {

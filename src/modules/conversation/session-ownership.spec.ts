@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { VoiceService, freshImages, sttPrompt } from "../voice/voice.service";
+import { VoiceService, asksForFigure, freshImages, sttPrompt } from "../voice/voice.service";
 import type { VoiceSession } from "./conversation-memory.service";
 
 describe("voice turn helpers", () => {
@@ -25,6 +25,16 @@ describe("voice turn helpers", () => {
     const same = { url: "/auth/catalog/textbook-images/40/figures/p9_9.jpg?access_token=b" } as never;
     assert.equal(freshImages(live, [fig]).length, 1);
     assert.equal(freshImages(live, [same]).length, 0);
+  });
+
+  it("re-shows a figure the student asks for by name", () => {
+    const live = { shownImages: new Set<string>() };
+    const fig = { url: "/auth/catalog/textbook-images/40/figures/p13_2.jpg" } as never;
+    freshImages(live, [fig]);
+    assert.equal(asksForFigure("Can you get me the figure 2.12?"), true);
+    assert.equal(asksForFigure("Can you show me the map?"), true);
+    assert.equal(asksForFigure("What is a map?"), false);
+    assert.equal(freshImages(live, [fig], asksForFigure("Can you get me the figure 2.12?")).length, 1);
   });
 });
 
