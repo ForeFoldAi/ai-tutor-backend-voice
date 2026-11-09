@@ -1,7 +1,7 @@
 import { Injectable } from "@nestjs/common";
 import { config } from "../../../config";
 import { int16ToWav, PCM_SAMPLE_RATE } from "../../../audio/pcm";
-import { ISTTProvider, SttHints } from "../interfaces/voice-provider";
+import { ISTTProvider, SttHints, SttResult } from "../interfaces/voice-provider";
 
 /**
  * Whisper STT, by way of FastAPI's faster-whisper (CTranslate2 int8).
@@ -13,7 +13,7 @@ import { ISTTProvider, SttHints } from "../interfaces/voice-provider";
  */
 @Injectable()
 export class WhisperSttProvider implements ISTTProvider {
-  async transcribe(pcm: Int16Array, hints: SttHints = {}): Promise<string> {
+  async transcribe(pcm: Int16Array, hints: SttHints = {}): Promise<SttResult> {
     const headers: Record<string, string> = {};
     if (config.voiceInternalToken) headers["X-Voice-Token"] = config.voiceInternalToken;
     else if (hints.token) headers.Authorization = `Bearer ${hints.token}`;
@@ -32,7 +32,11 @@ export class WhisperSttProvider implements ISTTProvider {
       signal: AbortSignal.timeout(config.sttTimeoutMs),
     });
     if (!res.ok) throw new Error(`stt http ${res.status}`);
-    const body = (await res.json()) as { transcript?: string };
-    return String(body.transcript || "").trim();
+    const body = (await res.json()) as { transcript?: string; confidence?: number };
+    const confidence = Number(body.confidence);
+    return {
+      text: String(body.transcript || "").trim(),
+      confidence: Number.isFinite(confidence) ? confidence : undefined,
+    };
   }
 }

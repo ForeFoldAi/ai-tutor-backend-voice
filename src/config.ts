@@ -66,16 +66,26 @@ export const config = {
   sttMinUtteranceMs: envInt("STT_MIN_UTTERANCE_MS", 350),
   /** Min RMS on captured PCM — rejects silence/noise Whisper labels as (laughing). */
   sttMinSpeechRms: Number(env("STT_MIN_SPEECH_RMS", "0.008")) || 0.008,
+  /** Min voiced audio (VAD frames, hang excluded) — a short "six" clears it, a click or breath doesn't. */
+  sttMinVoicedMs: envInt("STT_MIN_VOICED_MS", 180),
+  /**
+   * Mean Whisper avg_logprob below which a short (<= 3 word) transcript is dropped.
+   * Noise hallucinations ("Thank you.", "I'm not sure.") decode with low confidence.
+   */
+  sttMinShortConfidence: Number(env("STT_MIN_SHORT_CONFIDENCE", "-0.75")) || -0.75,
   /** Ignore mic after tutor audio ends — speaker echo otherwise becomes a fake turn. */
   sttPostPlaybackMs: envInt("STT_POST_PLAYBACK_MS", 1000),
-  /** Silence that ends a student turn. 900ms cut kids off mid-question while they thought. */
-  vadHangMs: envInt("VAD_HANG_MS", 1500),
+  /**
+   * Silence that ends a student turn. Kept short so replies start sooner; a student who
+   * pauses longer mid-question is caught by VAD_MERGE_MS instead of being cut off.
+   */
+  vadHangMs: envInt("VAD_HANG_MS", 1000),
   /**
    * Speech resumed this soon after a turn ended, before any reply audio, joins that turn.
-   * Counted after the VAD_HANG_MS silence, so 2500 tolerates a ~4 s mid-sentence pause; longer
+   * Counted after the VAD_HANG_MS silence, so 3000 tolerates a ~4 s mid-sentence pause; longer
    * glued a repeated or new question onto the previous one while it was still being answered.
    */
-  vadMergeMs: envInt("VAD_MERGE_MS", 2500),
+  vadMergeMs: envInt("VAD_MERGE_MS", 3000),
   /** Edge (via FastAPI) is the only TTS engine. en-IN-NeerjaNeural | en-IN-PrabhatNeural */
   edgeTtsVoice: env("EDGE_TTS_VOICE", "en-IN-NeerjaNeural"),
   /** Per attempt; one retry follows, so worst case is ~2x this before a voice_error. */

@@ -148,6 +148,26 @@ export function postprocessTranscript(text: string, subjectName = ""): string {
     .trim();
 }
 
+/**
+ * Short transcript Whisper was unsure of. On noise, breath or speaker bleed it
+ * produces fluent stock lines ("Thank you.", "I'm not sure.", "It's a very good
+ * time.") with a low avg_logprob; a real short reply decodes confidently.
+ */
+export function isLowConfidenceShort(text: string, confidence: number | undefined, minConfidence: number): boolean {
+  if (confidence === undefined) return false;
+  const words = (text || "").trim().split(/\s+/).filter(Boolean).length;
+  return words <= 3 && confidence < minConfidence;
+}
+
+/** Spoken hesitation before the real question ("Um, so what is…") — not part of the ask. */
+const LEAD_IN_RE = /^(?:(?:um+|uh+|erm+|hmm+|ah+)\b[\s,.…-]*)+/i;
+const SO_BEFORE_QUESTION_RE = /^so[\s,]+(?=(?:what|why|how|who|where|when|which|can|could|is|are|do|does|tell|explain)\b)/i;
+
+export function stripLeadIn(text: string): string {
+  const out = (text || "").replace(LEAD_IN_RE, "").replace(SO_BEFORE_QUESTION_RE, "").trim();
+  return out ? out.charAt(0).toUpperCase() + out.slice(1) : (text || "").trim();
+}
+
 /** True when STT mostly repeats the tutor's last spoken line (speaker echo). */
 export function isLikelyEcho(user: string, assistant: string): boolean {
   const u = junkKey(user);

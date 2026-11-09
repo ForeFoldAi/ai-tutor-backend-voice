@@ -25,6 +25,29 @@ describe("pendingQuestion", () => {
     assert.equal(pendingQuestion("That's how powers work. Want me to show you step by step?"), "");
     assert.equal(pendingQuestion("Plants make food using sunlight."), "");
   });
+  it("ignores mishearing checks and questions about the student", () => {
+    assert.equal(pendingQuestion("I think I may have misheard — did you mean **Tapestry**?"), "");
+    assert.equal(pendingQuestion("Their borders kept shifting. What part feels confusing to you right now?"), "");
+    assert.equal(pendingQuestion("Krishnadevaraya expanded it. Does that give you a clear picture?"), "");
+    assert.equal(pendingQuestion("You'll see them on the coast. Does that help you picture where they are?"), "");
+    assert.equal(pendingQuestion("So, what part of the Mughal story interests you most?"), "");
+    assert.equal(pendingQuestion("Ready to try a quick quiz, or do you want to move to the next topic?"), "");
+  });
+  it("ignores choices that have no right answer", () => {
+    assert.equal(
+      pendingQuestion("Fourth, among social groups. Which of these four forms do you want to explore first?"),
+      "",
+    );
+    assert.equal(pendingQuestion("Shall we start with the distance formula?"), "");
+    assert.equal(pendingQuestion("Which one would you like to learn next?"), "");
+  });
+  it("still tracks real check questions", () => {
+    assert.equal(
+      pendingQuestion("Akbar split the empire into provinces. Which part of the empire did Akbar call a subah?"),
+      "Which part of the empire did Akbar call a subah?",
+    );
+    assert.equal(pendingQuestion("Where was the capital of Vijayanagara?"), "Where was the capital of Vijayanagara?");
+  });
 });
 
 describe("classifyReplyIntent", () => {
@@ -41,6 +64,20 @@ describe("classifyReplyIntent", () => {
 
   it("grades substantive quiz answers as wrong-answer candidate", () => {
     assert.equal(classifyReplyIntent("kings and their armies", true), "WRONG_ANSWER");
+  });
+
+  it("never grades a request to be taught or a misheard-turn protest", () => {
+    for (const ask of [
+      "I am fine. Keep teaching me this lesson.",
+      "I am saying please keep teaching this lesson to me.",
+      "Do you play a teacher role and teach me the coordinate geometry lesson.",
+      "I did not say anything yet.",
+      "Continue the lesson",
+      "Let's move on",
+    ]) {
+      assert.equal(classifyReplyIntent(ask, true), "NEW_QUESTION", ask);
+      assert.equal(dialogueActForUtterance(ask, true), null, ask);
+    }
   });
 
   it("treats affirmation as new question when quiz pending", () => {

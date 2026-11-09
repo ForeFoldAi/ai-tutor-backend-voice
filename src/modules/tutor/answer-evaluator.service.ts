@@ -152,6 +152,8 @@ export class AnswerEvaluatorService {
     next: number;
     student: string;
     classLevel: string;
+    /** The tutor's last explanation — the only source a hint or an unstored answer may use. */
+    lesson?: string;
   }): Promise<string> {
     const { quiz, outcomes, next } = opts;
     const many = quiz.length > 1;
@@ -161,10 +163,13 @@ export class AnswerEvaluatorService {
       const fig = q.figure ? ` Point them to ${q.figure.figure_number ? `Figure ${q.figure.figure_number}` : "the figure"} shown on screen.` : "";
       if (o.grade === "CORRECT") return `${label(o.index)} ("${q.question}"): CORRECT. Praise briefly.`;
       if (o.revealed) {
-        return `${label(o.index)} ("${q.question}"): wrong again. Say the correct answer${q.expected ? ` (${q.expected})` : ""} in one line.`;
+        return q.expected
+          ? `${label(o.index)} ("${q.question}"): wrong again. Say the correct answer (${q.expected}) in one line.`
+          : `${label(o.index)} ("${q.question}"): wrong again. Give the answer in one line ONLY if the tutor's last explanation states it; otherwise do not name any answer, just say you'll go over it together.`;
       }
-      return `${label(o.index)} ("${q.question}"): not right yet, first try${q.expected ? ` (answer: ${q.expected} — do NOT say it)` : ""}. Give ONE short hint and invite another try.${fig}`;
+      return `${label(o.index)} ("${q.question}"): not right yet, first try${q.expected ? ` (answer: ${q.expected} — do NOT say it)` : ""}. Give ONE short hint taken from the tutor's last explanation and invite another try.${fig}`;
     });
+    const lesson = (opts.lesson || "").trim().slice(-1200);
     const correct = quiz.filter((q) => q.grade === "CORRECT").length;
     // A hint already ends on "try again" — don't stack a second question on it.
     const hinted = outcomes.some((o) => !quiz[o.index].done);
@@ -183,9 +188,15 @@ export class AnswerEvaluatorService {
             role: "system",
             content:
               `You are a warm teacher speaking aloud to a ${opts.classLevel || "school"} student during a quiz. ` +
-              "Plain spoken sentences only, no markdown or lists, under 60 words. Use exactly the verdicts and answers given — never re-grade, never change a number, never add new facts.",
+              "Plain spoken sentences only, no markdown or lists, under 60 words. Use exactly the verdicts and answers given — never re-grade, never change a number, never add new facts. " +
+              "Never invent an answer or bring in a topic or subject that is not in the tutor's last explanation.",
           },
-          { role: "user", content: `Student said: "${opts.student}"\n${lines.join("\n")}\n${close}` },
+          {
+            role: "user",
+            content:
+              `${lesson ? `Tutor's last explanation: "${lesson}"\n` : ""}` +
+              `Student said: "${opts.student}"\n${lines.join("\n")}\n${close}`,
+          },
         ],
         160,
       );
@@ -193,11 +204,17 @@ export class AnswerEvaluatorService {
     } catch {
       /* fall through */
     }
+    // Spoken aloud: "The question: exactly right!" sounds like a form, so only number them in a multi-question quiz.
+    const lead = (i: number) => (many ? `${label(i)}: ` : "");
     const said = outcomes.map((o) => {
       const q = quiz[o.index];
-      if (o.grade === "CORRECT") return `${label(o.index)}: exactly right!`;
-      if (o.revealed) return `${label(o.index)}: not quite. The answer is ${q.expected || "in what we just covered"}.`;
-      return `${label(o.index)}: not quite yet. Have another go.`;
+      if (o.grade === "CORRECT") return `${lead(o.index)}Exactly right!`;
+      if (o.revealed) {
+        return q.expected
+          ? `${lead(o.index)}Not quite. The answer is ${q.expected}.`
+          : `${lead(o.index)}Not quite. Let's go over it together.`;
+      }
+      return `${lead(o.index)}Not quite yet. Have another go.`;
     });
     if (next >= 0 && !hinted) said.push(`Now, ${label(next).toLowerCase()}: ${quiz[next].question}`);
     if (next < 0 && many) said.push(`You got ${correct} out of ${quiz.length}.`);

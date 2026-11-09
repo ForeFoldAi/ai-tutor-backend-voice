@@ -1,7 +1,7 @@
 import { Injectable } from "@nestjs/common";
 import { TutorAction, AnswerGrade, QuizItem } from "./interfaces";
 import { followupIntent, isRecallQuestion } from "./query-rewriter";
-import { classifyReplyIntent } from "./reply-intent";
+import { classifyReplyIntent, isTeachRequest } from "./reply-intent";
 
 /** Clear refusals / topic pivots while a check question is open. */
 const REFUSAL_OR_PIVOT =
@@ -45,6 +45,8 @@ export function decideAction(opts: {
   if (opts.awaitingAnswer) {
     // "I don't know" uses up an attempt on the open question (hint, then reveal).
     if (intent === "DONT_KNOW") return "EVALUATE";
+    // "Keep teaching me this lesson" drops the check question and teaches.
+    if (isTeachRequest(opts.utterance)) return "EXPLAIN";
     if (!isRecallQuestion(opts.utterance) && looksLikeAnswer(opts.utterance)) return "EVALUATE";
     if (looksLikeNewQuestion(opts.utterance)) return "EXPLAIN";
     if (REFUSAL_OR_PIVOT.test(opts.utterance.trim())) return "ANSWER";

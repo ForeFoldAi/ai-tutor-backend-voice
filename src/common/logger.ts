@@ -32,6 +32,10 @@ export type VoiceLog = {
   isRecall?: boolean;
   retrievalRewrote?: boolean;
   synthetic?: boolean;
+  /** Voiced audio in a dropped utterance (VAD frames, hang excluded). */
+  voicedMs?: number;
+  /** Mean Whisper avg_logprob of a dropped transcript. */
+  sttConfidence?: number;
   error?: string;
 };
 

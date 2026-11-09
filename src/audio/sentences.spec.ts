@@ -31,6 +31,16 @@ describe("streaming sentence split", () => {
     assert.ok(chunks[0].length < 80, `first chunk should flush early: ${chunks[0]}`);
   });
 
+  it("starts speaking a long opening sentence at its first clause break", () => {
+    const s = new SentenceStream();
+    const opening =
+      "Power gets shared through specific arrangements in a democracy, first between different levels of government";
+    const out = s.push(opening);
+    assert.deepEqual(out, ["Power gets shared through specific arrangements in a democracy,"]);
+    // Later chunks still wait for whole sentences; numbers like "3,5" never split.
+    assert.deepEqual(s.push(", and the ratio 3,5 matters"), []);
+  });
+
   it("waits for a sentence to finish before emitting it", () => {
     const s = new SentenceStream(10, 10);
     // No trailing whitespace yet, so the sentence may still be growing.

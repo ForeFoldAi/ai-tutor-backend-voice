@@ -12,6 +12,8 @@
  */
 
 export const FIRST_CHUNK_MIN_CHARS = 40;
+/** No sentence end yet: the first chunk may stop at a comma/semicolon/colon/dash past this. */
+export const FIRST_CLAUSE_MIN_CHARS = 60;
 export const CHUNK_MIN_CHARS = 80;
 /** Force a break in run-on text so an unpunctuated list can't stall the stream. */
 export const CHUNK_MAX_CHARS = 320;
@@ -99,8 +101,8 @@ export class SentenceStream {
     this.buf += text;
     const out: string[] = [];
     for (;;) {
-      const threshold = this.emitted === 0 ? this.firstMin : this.min;
-      const cut = this.cutPoint(threshold);
+      const first = this.emitted === 0;
+      const cut = this.cutPoint(first ? this.firstMin : this.min, first);
       if (cut < 0) break;
       const chunk = this.buf.slice(0, cut).trim();
       this.buf = this.buf.slice(cut);
@@ -127,7 +129,7 @@ export class SentenceStream {
    * Index to cut at: the first sentence end past `min`, or a word break once
    * the buffer runs past `max` without any punctuation.
    */
-  private cutPoint(min: number): number {
+  private cutPoint(min: number, first = false): number {
     // A terminator only counts as a boundary when whitespace follows it —
     // otherwise "3." mid-number, or a sentence still being typed, splits early.
     const re = /[.!?]\s/g;
@@ -137,6 +139,14 @@ export class SentenceStream {
       // "2." opening a list line is a step number, not a sentence end.
       if (/(?:^|\n)[ \t]*\d+$/.test(this.buf.slice(0, m.index))) continue;
       if (end >= min) return end;
+    }
+    // A long opening sentence would hold back the first audio; a clause break is a natural pause.
+    // "3,5" or "1:2" has no space after the mark, so numbers never split.
+    if (first) {
+      const clause = /[,;:—–]\s/g;
+      while ((m = clause.exec(this.buf)) !== null) {
+        if (m.index + 1 >= FIRST_CLAUSE_MIN_CHARS) return m.index + 1;
+      }
     }
     if (this.buf.length >= this.max) {
       const space = this.buf.lastIndexOf(" ", this.max);
