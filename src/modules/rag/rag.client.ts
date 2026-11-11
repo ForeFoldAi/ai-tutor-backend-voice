@@ -30,6 +30,8 @@ export type RagAskOptions = {
   affectTrajectory?: string[];
   /** Ephemeral student upload ids from POST /auth/tutor/images */
   imageIds?: string[];
+  /** Student asked for shorter answers earlier in the session. */
+  prefersShort?: boolean;
 };
 
 export type AssistantAskOptions = {

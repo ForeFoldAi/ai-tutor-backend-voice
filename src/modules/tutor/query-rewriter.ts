@@ -93,6 +93,22 @@ export function groundChapterQuery(current: string, chapterName: string): string
   return q;
 }
 
+const COUNT_WORDS: Record<string, number> = {
+  one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+  a: 1, an: 1, single: 1, couple: 2, few: 3,
+};
+const QUIZ_COUNT = /\b(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|a|an|single|couple|few)\s+(?:of\s+)?(?:(?:quick|short|simple|small|more|mcq|multiple[\s-]choice)\s+)*(?:questions?|qs|mcqs?)\b/i;
+
+/** How many questions the student asked for ("ask me 5 questions"), clamped to 1-10; null when unstated. */
+export function quizCount(q: string): number | null {
+  const m = (q || "").match(QUIZ_COUNT);
+  if (!m) return null;
+  const tok = m[1].toLowerCase();
+  const n = /^\d+$/.test(tok) ? Number(tok) : COUNT_WORDS[tok];
+  if (!n) return null;
+  return Math.min(10, Math.max(1, n));
+}
+
 export function followupIntent(q: string): "simplify" | "example" | "quiz" | "normal" {
   if (SIMPLIFY.test(q)) return "simplify";
   if (EXAMPLE.test(q)) return "example";

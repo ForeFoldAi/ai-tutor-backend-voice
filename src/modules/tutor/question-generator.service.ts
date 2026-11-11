@@ -2,6 +2,20 @@ import { Injectable } from "@nestjs/common";
 import { LlmClient } from "../llm/llm.client";
 import type { ChatTurn, QuizItem, RagRelatedImage } from "./interfaces";
 
+const QUESTION_RULES =
+  "Ask the question directly, as a teacher would. Never refer to the conversation " +
+  '("The tutor mentioned...", "As we discussed...", "The tutor compared..."). ' +
+  "Never quiz an analogy or comparison the tutor made up (a city, a family, a puzzle, a game); quiz the real fact it explained. " +
+  'Keep "expected" to one short sentence a student could say.';
+
+/** Strip conversation references a model sometimes still leads with ("The tutor said X. ..."). */
+export function cleanQuestion(q: string): string {
+  return q
+    .replace(/^(?:the\s+tutor|we|you)\s+(?:mentioned|said|explained|compared|discussed|talked\s+about)[^.?!]*[.,]\s*/i, "")
+    .replace(/^as\s+(?:we|the\s+tutor)\s+(?:discussed|said|mentioned)[^,]*,\s*/i, "")
+    .trim();
+}
+
 @Injectable()
 export class QuestionGeneratorService {
   constructor(private readonly llm: LlmClient) {}
@@ -15,7 +29,9 @@ export class QuestionGeneratorService {
         {
           role: "system",
           content:
-            'Write ONE short spoken check question for a Class 1–10 student from the textbook excerpt. JSON: {"question":"...","expected":"..."} Difficulty 1=very easy, 5=advanced. No markdown.',
+            "Write ONE short spoken check question for a Class 1–10 student about a fact or idea in the excerpt. " +
+            QUESTION_RULES +
+            ' JSON: {"question":"...","expected":"..."} Difficulty 1=very easy, 5=advanced. No markdown.',
         },
         {
           role: "user",
@@ -30,7 +46,7 @@ export class QuestionGeneratorService {
         expected?: string;
       };
       if (json.question) {
-        return { question: json.question.trim(), expected: (json.expected || "").trim() };
+        return { question: cleanQuestion(json.question.trim()), expected: (json.expected || "").trim() };
       }
     } catch {
       /* fall through */
@@ -59,8 +75,10 @@ export class QuestionGeneratorService {
           {
             role: "system",
             content:
-              `Write ${count} short spoken quiz question(s) for a school student, using ONLY facts the Tutor actually said in this session. ` +
-              "No new topics, no facts from outside the transcript, no page numbers. Do not mention a map, figure or picture unless you set figure_index to one from the list. " +
+              `Write exactly ${count} short spoken quiz question(s) for a school student about the chapter facts the Tutor taught in this session ` +
+              "(people, dynasties, events, places, terms, causes and effects). " +
+              QUESTION_RULES +
+              " No new topics, no facts from outside the transcript, no page numbers. Do not mention a map, figure or picture unless you set figure_index to one from the list. " +
               "For math, use numbers the session worked with and give the exact final answer. " +
               'JSON only: [{"question":"...","expected":"...","figure_index":null}]',
           },
@@ -69,7 +87,7 @@ export class QuestionGeneratorService {
             content: `Earlier summary: ${summary || "(none)"}\n\nTranscript:\n${talk.slice(-4000)}\n\nFigures shown on screen:\n${figs || "(none)"}`,
           },
         ],
-        400,
+        Math.max(400, count * 110),
       );
       const rows = JSON.parse(raw.replace(/```json|```/g, "").trim()) as {
         question?: string;
@@ -80,7 +98,7 @@ export class QuestionGeneratorService {
         .filter((r) => r.question?.trim())
         .slice(0, count)
         .map((r) => ({
-          question: r.question!.trim(),
+          question: cleanQuestion(r.question!.trim()),
           expected: (r.expected || "").trim(),
           figure: r.figure_index != null ? figures[Number(r.figure_index)] : undefined,
           attempts: 0,

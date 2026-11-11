@@ -12,7 +12,8 @@ export type TutorAction =
   | "RECALL"
   | "REQUEST_CLARIFICATION";
 
-export type AnswerGrade = "CORRECT" | "PARTIALLY_CORRECT" | "INCORRECT" | "UNCERTAIN";
+/** NOT_AN_ANSWER: the reply is about something else (a statement, a new question) — it uses no attempt. */
+export type AnswerGrade = "CORRECT" | "PARTIALLY_CORRECT" | "INCORRECT" | "UNCERTAIN" | "NOT_AN_ANSWER";
 
 export type VoiceState =
   | "IDLE"

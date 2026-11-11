@@ -30,6 +30,8 @@ export type VoiceSession = {
   lastFillerPhrase: string;
   /** Textbook figures shown this session — the only figures a quiz question may point at. */
   figures: RagRelatedImage[];
+  /** Student asked for shorter answers; holds for the rest of the session. */
+  prefersShort?: boolean;
 };
 
 const key = (id: string) => `voice:rtc:${id}`;

@@ -1,7 +1,7 @@
 import { Injectable } from "@nestjs/common";
 import { TutorAction, AnswerGrade, QuizItem } from "./interfaces";
 import { followupIntent, isRecallQuestion } from "./query-rewriter";
-import { classifyReplyIntent, isTeachRequest } from "./reply-intent";
+import { classifyReplyIntent, isNonAnswer, isTeachRequest } from "./reply-intent";
 
 /** Clear refusals / topic pivots while a check question is open. */
 const REFUSAL_OR_PIVOT =
@@ -47,6 +47,8 @@ export function decideAction(opts: {
     if (intent === "DONT_KNOW") return "EVALUATE";
     // "Keep teaching me this lesson" drops the check question and teaches.
     if (isTeachRequest(opts.utterance)) return "EXPLAIN";
+    // Pushback, "prove it", or the student's own MCQ: answer it; a multi-question quiz waits.
+    if (isNonAnswer(opts.utterance)) return "EXPLAIN";
     if (!isRecallQuestion(opts.utterance) && looksLikeAnswer(opts.utterance)) return "EVALUATE";
     if (looksLikeNewQuestion(opts.utterance)) return "EXPLAIN";
     if (REFUSAL_OR_PIVOT.test(opts.utterance.trim())) return "ANSWER";
@@ -69,6 +71,8 @@ export function afterExplainShouldCheck(
   // A recall answer ("you asked X") is not a taught concept — never
   // follow it with a comprehension check.
   if (action === "EXPLAIN" || action === "RECALL") return false;
+  // Quiz feedback turns (including the one that reads out the final score) never append a new check.
+  if (action === "CONTINUE_LESSON" || action === "ASK_QUESTION" || action === "GIVE_HINT") return false;
   if (snap.awaitingAnswer) return false;
   if (assistantText.trim().endsWith("?")) return false;
   return snap.turnsSinceCheck >= 2 && assistantText.length > 80;
@@ -88,9 +92,28 @@ export function openQuizIndexes(quiz: QuizItem[]): number[] {
   return quiz.flatMap((q, i) => (q.done ? [] : [i]));
 }
 
+/** Every grade this turn says the reply was not an attempt — answer it normally instead of grading. */
+export function isNotAnAnswer(grades: QuizGrade[]): boolean {
+  return grades.length > 0 && grades.every((g) => g.grade === "NOT_AN_ANSWER");
+}
+
+/** Correct = 1, partly correct = 0.5. */
+export function quizScore(quiz: QuizItem[]): number {
+  return quiz.reduce((s, q) => s + (q.grade === "CORRECT" ? 1 : q.grade === "PARTIALLY_CORRECT" && !q.revealed ? 0.5 : 0), 0);
+}
+
+/** "2", "2 and a half", "a half" — spoken score. */
+export function spokenScore(score: number): string {
+  const whole = Math.floor(score);
+  const half = score - whole >= 0.5;
+  if (!half) return String(whole);
+  return whole ? `${whole} and a half` : "a half";
+}
+
 /**
- * Apply this turn's grades. Correct closes an item; a miss uses an attempt and
- * the second miss reveals the answer. Items the student didn't address stay open.
+ * Apply this turn's grades. Correct or partly correct closes an item; a miss uses an
+ * attempt and the second miss reveals the answer. UNCERTAIN and NOT_AN_ANSWER use no
+ * attempt. Items the student didn't address stay open.
  * `next` is the lowest-numbered open item, or -1 when the quiz is finished.
  */
 export function applyQuizGrades(
@@ -102,8 +125,13 @@ export function applyQuizGrades(
   for (const { index, grade } of grades) {
     const item = out[index];
     if (!item || item.done) continue;
+    if (grade === "NOT_AN_ANSWER") continue;
+    if (grade === "UNCERTAIN") {
+      outcomes.push({ index, grade, revealed: false });
+      continue;
+    }
     item.grade = grade;
-    if (grade === "CORRECT") {
+    if (grade === "CORRECT" || grade === "PARTIALLY_CORRECT") {
       item.done = true;
     } else {
       item.attempts += 1;
