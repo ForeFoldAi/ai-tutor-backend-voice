@@ -22,16 +22,19 @@ import {
   afterExplainShouldCheck,
   applyQuizGrades,
   decideAction,
+  isNotAnAnswer,
   openQuizIndexes,
 } from "../tutor/tutor-orchestrator.service";
+import type { QuizGrade } from "../tutor/tutor-orchestrator.service";
 import {
+  asksForShortAnswers,
   classifyReplyIntent,
   isBareAcknowledgement,
   dialogueActForUtterance,
   pendingQuestion,
 } from "../tutor/reply-intent";
 import type { DialogueAct } from "../tutor/reply-intent";
-import { followupIntent, isRecallQuestion, topicFromQuestion } from "../tutor/query-rewriter";
+import { followupIntent, isRecallQuestion, quizCount, topicFromQuestion } from "../tutor/query-rewriter";
 import { NestFollowupIntent } from "../tutor/interfaces";
 import { RecallService } from "../tutor/recall.service";
 import { AnswerGrade, ChatTurn, SessionScope } from "../tutor/interfaces";
@@ -575,6 +578,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     const history = session.recentMessages;
     const chapterName = session.scope.chapterNames[0] || session.scope.chapter || "";
     const followup = followupIntent(utterance);
+    if (asksForShortAnswers(utterance)) session.prefersShort = true;
     const replyIntent = classifyReplyIntent(utterance, session.tutor.awaitingAnswer);
     const dialogueAct = dialogueActForUtterance(utterance, session.tutor.awaitingAnswer);
     // Leaving with questions still open: give the answers rather than leave them hanging.
@@ -642,6 +646,20 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     const recall = isRecallQuestion(utterance);
 
     try {
+      // Graded up front so a statement about something else ("India became independent
+      // in 1956") is answered normally instead of being marked a wrong quiz answer.
+      let quizGrades: QuizGrade[] | null = null;
+      if (action === "EVALUATE" && !recall) {
+        const open = openQuizIndexes(session.tutor.quiz);
+        quizGrades =
+          replyIntent === "DONT_KNOW"
+            ? [{ index: open[0], grade: "INCORRECT" as AnswerGrade }]
+            : await this.evaluator.gradeQuiz(session.tutor.quiz, open, utterance);
+        if (isNotAnAnswer(quizGrades)) {
+          action = "EXPLAIN";
+          quizGrades = null;
+        }
+      }
       // Questions about the conversation are answered from the transcript, not
       // the chapter. Must come before EVALUATE and the rewriter: "what did I
       // ask before?" is neither an answer to grade nor a retrieval query, and
@@ -679,7 +697,12 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       } else if (action === "START_QUIZ") {
         // Questions come from this session's transcript only — no chapter retrieval,
         // so no unrelated figures and no out-of-context questions.
-        const quiz = await this.questions.quizFromSession(history, session.summary, session.figures);
+        const quiz = await this.questions.quizFromSession(
+          history,
+          session.summary,
+          session.figures,
+          quizCount(utterance) ?? 3,
+        );
         if (!quiz.length) {
           action = "ANSWER";
           reply = MSG.quizNothingYet;
@@ -693,12 +716,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
           live?.emit("question_generated", { question: quiz[0].question, count: quiz.length });
         }
       } else if (action === "EVALUATE") {
-        const open = openQuizIndexes(session.tutor.quiz);
-        const grades =
-          replyIntent === "DONT_KNOW"
-            ? [{ index: open[0], grade: "INCORRECT" as AnswerGrade }]
-            : await this.evaluator.gradeQuiz(session.tutor.quiz, open, utterance);
-        const result = applyQuizGrades(session.tutor.quiz, grades);
+        const result = applyQuizGrades(session.tutor.quiz, quizGrades || []);
         setQuiz(session, result.quiz);
         for (const o of result.outcomes) {
           if (o.grade === "CORRECT") session.tutor.consecutiveCorrect += 1;
@@ -714,7 +732,12 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         session.tutor.consecutiveCorrect = next.consecutiveCorrect;
         session.tutor.consecutiveIncorrect = next.consecutiveIncorrect;
         grade = result.outcomes[0]?.grade;
-        action = result.next < 0 ? "CONTINUE_LESSON" : grade === "CORRECT" ? "ASK_QUESTION" : "GIVE_HINT";
+        action =
+          result.next < 0
+            ? "CONTINUE_LESSON"
+            : grade === "CORRECT" || grade === "PARTIALLY_CORRECT"
+              ? "ASK_QUESTION"
+              : "GIVE_HINT";
         for (const o of result.outcomes) {
           void this.progress.recordGrade({
             studentId: session.studentId,
@@ -822,7 +845,8 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       ) {
         // The LLM often asks its own check-in ("what would 2^4 be? Just guess!") —
         // track it so the next reply is graded instead of treated as a new question.
-        const question = pendingQuestion(reply);
+        // Only with an answer key: without one, an unrelated next statement got graded "wrong".
+        const question = checkExpected.trim() ? pendingQuestion(reply) : "";
         if (question) {
           setQuiz(session, [{ question, expected: checkExpected, attempts: 0, done: false }]);
           session.tutor.turnsSinceCheck = 0;
@@ -1225,7 +1249,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         return { answer: MSG.authExpired, retrievedIds: [], pages: [], images: [], ms: 0 };
       }
       this.log.warn(`assistant stream ${err}`);
-      return this.failMidStream(live, session, speech, committed || spoken > 0, said);
+      return this.failMidStream(live, session, speech, committed || spoken > 0, said, MSG.llmFail);
     }
   }
 
@@ -1243,7 +1267,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         return { answer: MSG.authExpired, retrievedIds: [], pages: [], images: [], ms: 0 };
       }
       this.log.warn(`assistant ${err}`);
-      return { answer: MSG.ragFail, retrievedIds: [], pages: [], images: [], ms: 0 };
+      return { answer: MSG.llmFail, retrievedIds: [], pages: [], images: [], ms: 0 };
     }
   }
 
@@ -1284,6 +1308,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       fillerPhrasePlayed: live?.lastFillerPhrase || session.lastFillerPhrase,
       affectTrajectory: session.affectTrajectory,
       imageIds,
+      prefersShort: session.prefersShort,
     };
 
     if (!this.streaming(live)) {
@@ -1361,6 +1386,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     speech: SpeechStream,
     streaming: boolean,
     said: string,
+    failLine: string = MSG.ragFail,
   ): RagResult {
     // The answer was already spoken and only the post-answer work (panel, figures) failed:
     // the student has a complete reply, so an apology tacked on the end is just noise.
@@ -1368,8 +1394,8 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       this.log.warn("rag stream ended early after the answer was spoken; keeping the answer");
       return { answer: said.trim(), retrievedIds: [], pages: [], images: [], ms: 0 };
     }
-    if (streaming) this.streamSay(live, session, speech, MSG.ragFail);
-    return { answer: MSG.ragFail, retrievedIds: [], pages: [], images: [], ms: 0 };
+    if (streaming) this.streamSay(live, session, speech, failLine);
+    return { answer: failLine, retrievedIds: [], pages: [], images: [], ms: 0 };
   }
 
   private emitAuthExpired(live: Live | undefined): void {
@@ -1599,8 +1625,6 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
   }
 }
 
-/** Lesson words for Whisper's initial prompt — biases decoding toward the chapter's vocabulary. */
-/** Drops figures this connection already showed and marks the rest as shown. */
 /** Replace the open quiz and keep the FastAPI-facing fields in step with it. */
 export function setQuiz(session: VoiceSession, quiz: QuizItem[]): void {
   session.tutor.quiz = quiz;
@@ -1642,6 +1666,7 @@ export function asksForFigure(utterance: string): boolean {
   return FIGURE_ASK_RE.test(utterance || "");
 }
 
+/** Drops figures this connection already showed and marks the rest as shown. */
 export function freshImages(
   live: { shownImages: Set<string> },
   images: RagRelatedImage[],
@@ -1655,6 +1680,29 @@ export function freshImages(
   });
 }
 
+const VOCAB_STOP = new Set([
+  "about", "after", "again", "because", "before", "being", "could", "different", "every", "first", "great",
+  "other", "people", "really", "right", "should", "something", "their", "there", "these", "thing", "think",
+  "those", "through", "under", "where", "which", "while", "would", "makes", "sense", "today",
+]);
+
+/** Proper nouns and longer content words from the lesson so far ("territories", "Tughlaqs", "Sultanate"). */
+export function lessonVocabulary(texts: string[], limit = 18): string[] {
+  const counts = new Map<string, number>();
+  for (const text of texts) {
+    for (const w of text.match(/\b[A-Za-z][a-z]{5,}\b/g) || []) {
+      const key = w.toLowerCase();
+      if (VOCAB_STOP.has(key)) continue;
+      counts.set(key, (counts.get(key) || 0) + (/^[A-Z]/.test(w) ? 2 : 1));
+    }
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([w]) => w);
+}
+
+/** Lesson words for Whisper's initial prompt — biases decoding toward the chapter's vocabulary. */
 export function sttPrompt(session: VoiceSession): string {
   const parts = [
     ...session.scope.chapterNames,
@@ -1667,8 +1715,9 @@ export function sttPrompt(session: VoiceSession): string {
   // so that question biases Whisper toward "help" over a sound-alike like "hate".
   const lastReply = [...(session.recentMessages || [])].reverse().find((t) => t.role === "assistant")?.content || "";
   const asked = lastReply.match(/[^.!?]*\?/g)?.pop()?.trim() || "";
+  const vocab = lessonVocabulary([lastReply, ...(session.explainedPoints || [])]).join(", ");
   // Last in the prompt so FastAPI's 300-char cap trims the chapter names first, not the question.
-  return [topic, asked.slice(-200)].filter(Boolean).join(". ");
+  return [topic, vocab, asked.slice(-200)].filter(Boolean).join(". ");
 }
 
 function concat(parts: Int16Array[]): Int16Array {

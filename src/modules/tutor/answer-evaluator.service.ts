@@ -1,10 +1,18 @@
 import { Injectable } from "@nestjs/common";
 import { AnswerGrade, QuizItem } from "./interfaces";
 import { LlmClient } from "../llm/llm.client";
+import { quizScore, spokenScore } from "./tutor-orchestrator.service";
 import type { QuizGrade, QuizOutcome } from "./tutor-orchestrator.service";
 
 const STOP = new Set(["a", "an", "the", "and", "or", "to", "of", "for", "in", "on", "is"]);
-const GRADES = /PARTIALLY_CORRECT|INCORRECT|CORRECT|UNCERTAIN/;
+const GRADES = /NOT_AN_ANSWER|PARTIALLY_CORRECT|INCORRECT|CORRECT|UNCERTAIN/;
+
+const GRADING_RULES =
+  "Grade by meaning, not wording: a paraphrase, synonym or simpler phrasing of the expected idea is CORRECT. " +
+  "PARTIALLY_CORRECT when it gets part of the idea (one of several reasons, the right idea said vaguely). " +
+  "INCORRECT only when it is a real attempt that is wrong. " +
+  "NOT_AN_ANSWER when the student is not attempting this question at all: a statement about a different topic, " +
+  "a new question, a complaint, or a request. UNCERTAIN only when the reply is too garbled to judge.";
 
 export function tokenSet(s: string): Set<string> {
   return new Set(
@@ -96,7 +104,9 @@ export class AnswerEvaluatorService {
           {
             role: "system",
             content:
-              'Classify the student answer to the question as CORRECT, PARTIALLY_CORRECT, INCORRECT, or UNCERTAIN. If no expected answer is given, judge from the question itself. JSON only: {"grade":"..."}',
+              "Classify the student reply to the question as CORRECT, PARTIALLY_CORRECT, INCORRECT, NOT_AN_ANSWER or UNCERTAIN. " +
+              GRADING_RULES +
+              ' If no expected answer is given, judge from the question itself. JSON only: {"grade":"..."}',
           },
           {
             role: "user",
@@ -127,13 +137,18 @@ export class AnswerEvaluatorService {
           {
             role: "system",
             content:
-              'A student is answering a spoken quiz. Decide which of the listed questions their reply answers (one, several, or all) and grade only those as CORRECT, PARTIALLY_CORRECT, INCORRECT or UNCERTAIN. Skip questions they did not address. JSON only: [{"q":1,"grade":"..."}]',
+              "A student is answering a spoken quiz. Decide which of the listed questions their reply answers (one, several, or all) and grade only those as CORRECT, PARTIALLY_CORRECT, INCORRECT or UNCERTAIN. " +
+              GRADING_RULES +
+              ' Skip questions they did not address. If the reply attempts none of them, return [{"q":0,"grade":"NOT_AN_ANSWER"}]. JSON only: [{"q":1,"grade":"..."}]',
           },
           { role: "user", content: `${list}\n\nStudent: ${student}` },
         ],
         120,
       );
       const rows = JSON.parse(raw.replace(/```json|```/g, "").trim()) as { q?: number; grade?: string }[];
+      if (rows.length && rows.every((r) => /NOT_AN_ANSWER/.test(String(r.grade || "")))) {
+        return [{ index: open[0], grade: "NOT_AN_ANSWER" }];
+      }
       const grades = rows.flatMap((r) => {
         const index = Number(r.q) - 1;
         const grade = String(r.grade || "").match(GRADES)?.[0] as AnswerGrade | undefined;
@@ -162,6 +177,12 @@ export class AnswerEvaluatorService {
       const q = quiz[o.index];
       const fig = q.figure ? ` Point them to ${q.figure.figure_number ? `Figure ${q.figure.figure_number}` : "the figure"} shown on screen.` : "";
       if (o.grade === "CORRECT") return `${label(o.index)} ("${q.question}"): CORRECT. Praise briefly.`;
+      if (o.grade === "PARTIALLY_CORRECT") {
+        return `${label(o.index)} ("${q.question}"): PARTLY CORRECT, counts as half. Say what they got right, then add the missing part${q.expected ? ` (full answer: ${q.expected})` : ""} in one line.`;
+      }
+      if (o.grade === "UNCERTAIN") {
+        return `${label(o.index)} ("${q.question}"): could not make out the answer. Ask them kindly to say it again; do not count it as wrong.`;
+      }
       if (o.revealed) {
         return q.expected
           ? `${label(o.index)} ("${q.question}"): wrong again. Say the correct answer (${q.expected}) in one line.`
@@ -170,54 +191,86 @@ export class AnswerEvaluatorService {
       return `${label(o.index)} ("${q.question}"): not right yet, first try${q.expected ? ` (answer: ${q.expected} — do NOT say it)` : ""}. Give ONE short hint taken from the tutor's last explanation and invite another try.${fig}`;
     });
     const lesson = (opts.lesson || "").trim().slice(-1200);
-    const correct = quiz.filter((q) => q.grade === "CORRECT").length;
+    const score = spokenScore(quizScore(quiz));
     // A hint already ends on "try again" — don't stack a second question on it.
     const hinted = outcomes.some((o) => !quiz[o.index].done);
     const close =
       next >= 0
         ? hinted
           ? ""
-          : `Then ask ${label(next)} again: "${quiz[next].question}"`
+          : `Then ask ${label(next)}: "${quiz[next].question}"`
         : many
-          ? `Quiz finished: they got ${correct} of ${quiz.length}. Say the score warmly${quiz.some((q) => q.revealed) ? " and suggest revising the ones they missed" : ""}.`
+          ? `Quiz finished: they scored ${score} out of ${quiz.length}. Say the score warmly${quiz.some((q) => q.revealed) ? " and suggest revising the ones they missed" : ""}. Do not ask a new question.`
           : "";
-    try {
-      const reply = await this.llm.complete(
-        [
-          {
-            role: "system",
-            content:
-              `You are a warm teacher speaking aloud to a ${opts.classLevel || "school"} student during a quiz. ` +
-              "Plain spoken sentences only, no markdown or lists, under 60 words. Use exactly the verdicts and answers given — never re-grade, never change a number, never add new facts. " +
-              "Never invent an answer or bring in a topic or subject that is not in the tutor's last explanation.",
-          },
-          {
-            role: "user",
-            content:
-              `${lesson ? `Tutor's last explanation: "${lesson}"\n` : ""}` +
-              `Student said: "${opts.student}"\n${lines.join("\n")}\n${close}`,
-          },
-        ],
-        160,
-      );
-      if (reply.trim()) return reply.trim();
-    } catch {
-      /* fall through */
-    }
-    // Spoken aloud: "The question: exactly right!" sounds like a form, so only number them in a multi-question quiz.
-    const lead = (i: number) => (many ? `${label(i)}: ` : "");
-    const said = outcomes.map((o) => {
-      const q = quiz[o.index];
-      if (o.grade === "CORRECT") return `${lead(o.index)}Exactly right!`;
-      if (o.revealed) {
-        return q.expected
-          ? `${lead(o.index)}Not quite. The answer is ${q.expected}.`
-          : `${lead(o.index)}Not quite. Let's go over it together.`;
+    const messages = [
+      {
+        role: "system" as const,
+        content:
+          `You are a warm teacher speaking aloud to a ${opts.classLevel || "school"} student during a quiz. ` +
+          "Plain spoken sentences only, no markdown, lists or quotation marks, under 60 words. Use exactly the verdicts and answers given — never re-grade, never change a number, never add new facts. " +
+          "Never invent an answer or bring in a topic or subject that is not in the tutor's last explanation.",
+      },
+      {
+        role: "user" as const,
+        content:
+          `${lesson ? `Tutor's last explanation: "${lesson}"\n` : ""}` +
+          `Student said: "${opts.student}"\n${lines.join("\n")}\n${close}`,
+      },
+    ];
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const reply = await this.llm.complete(messages, 160);
+        if (reply.trim()) return cleanSpoken(reply);
+      } catch (err) {
+        console.warn("[quiz_feedback] llm failed", { attempt, error: (err as Error)?.message });
       }
-      return `${lead(o.index)}Not quite yet. Have another go.`;
-    });
-    if (next >= 0 && !hinted) said.push(`Now, ${label(next).toLowerCase()}: ${quiz[next].question}`);
-    if (next < 0 && many) said.push(`You got ${correct} out of ${quiz.length}.`);
-    return said.join(" ");
+    }
+    return cleanSpoken(fallbackFeedback(quiz, outcomes, next, score));
   }
+}
+
+/** Speakable text: no quotation marks, no doubled punctuation ("idea.." → "idea."). */
+export function cleanSpoken(text: string): string {
+  return (text || "")
+    .replace(/["“”]/g, "")
+    .replace(/(^|\s)'([^']+)'(?=[\s.,!?]|$)/g, "$1$2")
+    .replace(/\.{2,}/g, ".")
+    .replace(/([.!?])\s*\./g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+/** First content word of the expected answer — a hint that doesn't give the answer away. */
+function hintWord(expected: string): string {
+  const words = [...tokenSet(expected)].filter((w) => w.length > 3 && !/^\d+$/.test(w));
+  return words[0] || "";
+}
+
+/** Spoken without the LLM. "The question: exactly right!" sounds like a form, so only number them in a multi-question quiz. */
+export function fallbackFeedback(quiz: QuizItem[], outcomes: QuizOutcome[], next: number, score: string): string {
+  const many = quiz.length > 1;
+  const label = (i: number) => (many ? `Question ${i + 1}` : "The question");
+  const lead = (i: number) => (many ? `${label(i)}: ` : "");
+  const strip = (s: string) => s.replace(/[.!?\s]+$/, "");
+  const said = outcomes.map((o) => {
+    const q = quiz[o.index];
+    if (o.grade === "CORRECT") return `${lead(o.index)}Exactly right!`;
+    if (o.grade === "PARTIALLY_CORRECT") {
+      return q.expected ? `${lead(o.index)}Almost! The full answer is ${strip(q.expected)}.` : `${lead(o.index)}Almost, that's partly right!`;
+    }
+    if (o.grade === "UNCERTAIN") return `${lead(o.index)}Sorry, I didn't catch that. Can you say your answer again?`;
+    if (o.revealed) {
+      return q.expected
+        ? `${lead(o.index)}Not quite. The answer is ${strip(q.expected)}.`
+        : `${lead(o.index)}Not quite. Let's go over it together.`;
+    }
+    const hint = hintWord(q.expected);
+    return hint
+      ? `${lead(o.index)}Not quite yet. Here's a hint: think about ${hint}. ${q.question}`
+      : `${lead(o.index)}Not quite yet. Think again about what we just learned. ${q.question}`;
+  });
+  const hinted = outcomes.some((o) => !quiz[o.index].done);
+  if (next >= 0 && !hinted) said.push(`Now, ${label(next).toLowerCase()}: ${quiz[next].question}`);
+  if (next < 0 && many) said.push(`You got ${score} out of ${quiz.length}.`);
+  return said.join(" ");
 }

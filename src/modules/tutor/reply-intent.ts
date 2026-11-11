@@ -153,6 +153,39 @@ export function isTeachRequest(utterance: string): boolean {
   return TEACH_REQUEST_RE.test(q) || NOT_AN_ANSWER_RE.test(q);
 }
 
+const SHORT_ANSWERS_RE =
+  /\b(?:(?:stop|no\s+more|don'?t|do\s+not|avoid)\s+(?:giving\s+|making\s+|using\s+)?(?:such\s+|so\s+|very\s+)?long(?:er)?\s+(?:answers?|replies|explanations?)|(?:keep|make)\s+(?:it|them|your\s+answers?)\s+(?:short|shorter|brief)|(?:shorter|short|brief)\s+answers?\s+please|too\s+long|answers?\s+(?:are|is)\s+(?:too\s+)?long)\b/i;
+
+/** "Stop giving long answers" — a standing preference, not a one-turn request. */
+export function asksForShortAnswers(utterance: string): boolean {
+  return SHORT_ANSWERS_RE.test(utterance || "");
+}
+
+/** Pushback on the tutor ("are you sure", "my teacher said otherwise", "you're confusing me"). */
+const COMPLAINT_RE =
+  /\b(?:confus(?:ing|e)\s+(?:me|us)|(?:you(?:'re|\s+are)|you\s+r)\s+(?:wrong|confusing|telling|giving|saying|mixing)|are\s+you\s+sure|(?:i\s+)?(?:don'?t|do\s+not|can'?t)\s+believe|my\s+(?:teacher|sir|madam|ma'?am|book|textbook)\s+(?:said|says|explained|told|taught|shows?|has)|i\s+(?:asked|said|was\s+asking)\b|(?:you|that)\s+(?:said|told|answered)\s+(?:something\s+)?(?:different|else|wrong)|different\s+answers?|that'?s\s+(?:not\s+(?:right|correct|true)|wrong)|(?:makes?|making)\s+(?:it\s+)?(?:more\s+)?confusing)\b/i;
+
+/** Requests about how the tutor answers, not attempts at the question. */
+const META_REQUEST_RE =
+  /\b(?:prove\s+(?:it|that|this)|from\s+(?:my|the)\s+(?:text\s*book|book|chapter)|show\s+me\s+(?:where|in)|can\s+i\s+ask|(?:let\s+me|wait|hold\s+on).{0,20}(?:finish|think|answer\s+later)|(?:don'?t|do\s+not)\s+(?:wanna|want\s+to)\s+answer|not\s+ready|(?:stop|no\s+more)\s+(?:giving\s+)?long|(?:keep|make)\s+it\s+(?:short|simple|brief)|shorter\s+answers?|long\s+answers?|something\s+new|already\s+know|(?:simple|simpler|easy|easier|very\s+simple)\s+(?:english|words|language)|difficult\s+words|explain\s+(?:it\s+|that\s+|this\s+)?again|(?:another|different|real[\s-]life)\s+example|without\s+repeating|in\s+(?:just\s+)?(?:\d+|one|two|three|four|five)\s+(?:sentences?|lines?|points?|words?))\b/i;
+
+/** The student poses their own MCQ / true-false item ("Option A ... Option B ...", "true or false?"). */
+const STUDENT_POSED_RE =
+  /\b(?:true\s+or\s+false|choose\s+(?:the\s+)?(?:best|correct|right)|select\s+all|which\s+of\s+(?:the\s+)?(?:following|these|this\s+following)|(?:best|correct|right)\s+(?:and\s+correct\s+)?answer|i\s+will\s+give\s+(?:you\s+)?(?:the\s+)?options?)\b/i;
+const OPTION_TOKEN = /\b(?:option\s+[a-e1-4t]|\(?[a-d]\)|[a-d]\.)\s/gi;
+
+/**
+ * Not an attempt at the open check question: pushback, a request about how to answer,
+ * or the student asking their own MCQ. Grading these produced "Not quite yet, have another go"
+ * for "You are confusing me even more".
+ */
+export function isNonAnswer(utterance: string): boolean {
+  const q = (utterance || "").trim();
+  if (!q) return false;
+  if (COMPLAINT_RE.test(q) || META_REQUEST_RE.test(q) || STUDENT_POSED_RE.test(q)) return true;
+  return (q.match(OPTION_TOKEN) || []).length >= 2;
+}
+
 /**
  * The check question a tutor reply leaves open, or "".
  * Looks at the last two sentences — replies often end on "Just guess!" after the question.
@@ -177,6 +210,7 @@ export function classifyReplyIntent(utterance: string, quizPending: boolean): Re
   if (CLOSING_RE.test(q)) return "CLOSING";
   if (CONFUSION_RE.test(q)) return "DONT_KNOW";
   if (isTeachRequest(q)) return "NEW_QUESTION";
+  if (isNonAnswer(q)) return "NEW_QUESTION";
   if (quizPending && !AFFIRM_RE.test(q)) {
     return isBareAcknowledgement(q) ? "UNCLEAR" : "WRONG_ANSWER";
   }
