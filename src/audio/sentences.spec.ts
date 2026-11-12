@@ -173,4 +173,23 @@ describe("speakable fractions and labels", () => {
   it("never speaks source labels", () => {
     assert.equal(speakable("Beyond your textbook: carbon forms four bonds."), "carbon forms four bonds.");
   });
+
+  it("reads chemical formulas symbol by symbol, keeping subscripts", () => {
+    assert.equal(speakable("Water is H₂O."), "Water is H 2 O.");
+    assert.equal(speakable("Water is H2O."), "Water is H 2 O.");
+    assert.equal(speakable("Water is $\\text{H}_2\\text{O}$."), "Water is H 2 O.");
+    assert.equal(speakable("Ca(OH)₂ turns milky"), "C A O H whole 2 turns milky");
+    assert.equal(
+      speakable("CaCO₃(s) → CaO(s) + CO₂(g)↑"),
+      "C A C O 3 solid gives C A O solid plus C O 2 gas",
+    );
+    assert.equal(speakable("SO₄²⁻ and Na⁺"), "S O 4 2 minus and N A plus");
+    assert.equal(speakable("NaCl"), "N A C L");
+  });
+
+  it("leaves words and acronyms that only look like formulas", () => {
+    assert.equal(speakable("No, it is OK. IS this CBSE Class 10?"), "No, it is OK. IS this CBSE Class 10?");
+    assert.equal(speakable("Use A4 paper, a 5N force and MP3."), "Use A4 paper, a 5N force and MP3.");
+    assert.equal(speakable("He said Hello in India."), "He said Hello in India.");
+  });
 });

@@ -1,3 +1,5 @@
+import { chemistrySpeech } from "./chemistry-speech";
+
 /**
  * Incremental sentence splitter for streaming TTS.
  *
@@ -28,7 +30,7 @@ export const CHUNK_MAX_CHARS = 320;
  */
 export function speakable(text: string): string {
   return (
-    text
+    chemistrySpeech(text)
       // Source labels the student should never hear ("Beyond your textbook: …").
       .replace(/\b(?:beyond (?:your|the) textbook|beyond this chapter|additional context)\s*(?:\.\.\.|…|[:,—–-])\s*/gi, "")
       .replace(/```[\s\S]*?```/g, " ")
