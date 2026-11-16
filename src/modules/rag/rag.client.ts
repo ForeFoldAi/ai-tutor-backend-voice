@@ -276,7 +276,8 @@ export class RagClient {
   }
 
   /**
-   * Same body as the Ask AI Tutor text client — no voice_mode / chapter fields.
+   * Same body as the Ask AI Tutor text client, plus voice_mode (no chapter fields). The
+   * assistant only uses voice_mode to turn "give me 50 questions" into a spoken quiz.
    * POST /auth/student/assistant/chat/stream
    */
   async askAssistantStream(opts: AssistantAskOptions, handlers: RagStreamHandlers): Promise<RagResult> {
@@ -288,6 +289,7 @@ export class RagClient {
         content: t.content,
       })),
       agent_mode: opts.agentMode || "free",
+      voice_mode: true,
     };
     if (opts.imageIds?.length) body.image_ids = opts.imageIds;
 

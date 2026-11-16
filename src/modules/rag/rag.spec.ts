@@ -170,7 +170,7 @@ describe("RagClient askAssistantStream", () => {
     global.fetch = originalFetch;
   });
 
-  it("POSTs student_assistant URL with agent_mode and history only", async () => {
+  it("POSTs student_assistant URL with agent_mode, history and voice_mode only", async () => {
     let seenUrl = "";
     let seenBody: Record<string, unknown> = {};
     global.fetch = async (input, init) => {
@@ -197,7 +197,8 @@ describe("RagClient askAssistantStream", () => {
     assert.match(seenUrl, /\/auth\/student\/assistant\/chat\/stream$/);
     assert.equal(seenBody.agent_mode, "free");
     assert.equal(seenBody.query, "What is photosynthesis?");
-    assert.equal(seenBody.voice_mode, undefined);
+    // Only changes "give me 50 questions" turns (spoken quiz instead of a 50-line list).
+    assert.equal(seenBody.voice_mode, true);
     assert.equal(seenBody.board, undefined);
     assert.ok(Array.isArray(seenBody.conversation_history));
     assert.match(result.answer, /Same Ask AI answer/);
