@@ -10,6 +10,12 @@ export type RagResult = {
   images: RagRelatedImage[];
   ms: number;
   voiceMeta?: RagVoiceMeta;
+  /** Grounded interactive math panel from FastAPI finalize (voice_live_teaching). */
+  mathLesson?: Record<string, unknown>;
+  /** Grounded interactive science lab from FastAPI finalize. */
+  scienceExperiment?: Record<string, unknown>;
+  /** Prose without fences, paired with the latest panel event. */
+  panelCleanAnswer?: string;
 };
 
 export type RagAskOptions = {
@@ -61,6 +67,10 @@ export type RagStreamHandlers = {
   onReplace?: (clean: string) => void;
   /** Cumulative textbook figures for this turn (fires again only when new ones arrive). */
   onRelatedImages?: (images: RagRelatedImage[]) => void;
+  /** Interactive math exploration panel (catalog / pass-2 finalize). */
+  onMathLesson?: (lesson: Record<string, unknown>, cleanAnswer: string) => void;
+  /** Interactive science lab panel (catalog / pass-2 finalize). */
+  onScienceExperiment?: (experiment: Record<string, unknown>, cleanAnswer: string) => void;
 };
 
 /** Same collection key FastAPI builds in POST /auth/chat */
@@ -72,6 +82,9 @@ type NdjsonEvent = {
   type?: string;
   content?: string;
   images?: RagRelatedImage[];
+  lesson?: Record<string, unknown>;
+  experiment?: Record<string, unknown>;
+  clean_answer?: string;
   tutor_state?: string;
   explained_points?: string[];
   affect_summary?: string;
@@ -80,6 +93,11 @@ type NdjsonEvent = {
   affect_trajectory?: string[];
   quiz_expected?: string;
 };
+
+function asPanelObject(raw: unknown): Record<string, unknown> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  return raw as Record<string, unknown>;
+}
 
 function normalizeRelatedImages(raw: unknown): RagRelatedImage[] {
   if (!Array.isArray(raw)) return [];
@@ -155,8 +173,18 @@ export class RagClient {
     const retrievedIds: string[] = [];
     const pages: number[] = [];
     let images: RagRelatedImage[] = [];
+    let mathLesson: Record<string, unknown> | undefined;
+    let scienceExperiment: Record<string, unknown> | undefined;
+    let panelCleanAnswer: string | undefined;
     let voiceMeta: RagVoiceMeta | undefined;
     const sentences = new SentenceStream(config.streamFirstChunkChars, config.streamChunkChars);
+
+    const applyCleanAnswer = (clean: string) => {
+      if (!clean) return;
+      answer = clean;
+      panelCleanAnswer = clean;
+      handlers.onReplace?.(clean);
+    };
 
     const onLine = (line: string): void => {
       if (!line.trim()) return;
@@ -173,8 +201,7 @@ export class RagClient {
         }
       }
       if (ev.type === "clean_answer" && ev.content) {
-        answer = ev.content;
-        handlers.onReplace?.(ev.content);
+        applyCleanAnswer(ev.content);
       }
       if (ev.type === "related_images") {
         const batch = normalizeRelatedImages(ev.images);
@@ -187,6 +214,24 @@ export class RagClient {
           const id = img.textbook_upload_id && img.file_name ? `${img.textbook_upload_id}/${img.file_name}` : "";
           if (id) retrievedIds.push(id);
           if (img.page) pages.push(img.page);
+        }
+      }
+      if (ev.type === "math_lesson") {
+        const lesson = asPanelObject(ev.lesson);
+        if (lesson) {
+          mathLesson = lesson;
+          const clean = String(ev.clean_answer ?? "").trim();
+          if (clean) applyCleanAnswer(clean);
+          handlers.onMathLesson?.(lesson, clean || answer.trim());
+        }
+      }
+      if (ev.type === "science_experiment") {
+        const experiment = asPanelObject(ev.experiment);
+        if (experiment) {
+          scienceExperiment = experiment;
+          const clean = String(ev.clean_answer ?? "").trim();
+          if (clean) applyCleanAnswer(clean);
+          handlers.onScienceExperiment?.(experiment, clean || answer.trim());
         }
       }
       if (ev.type === "done") {
@@ -208,7 +253,17 @@ export class RagClient {
       const rest = sentences.flush();
       if (rest) handlers.onSentence(rest);
     }
-    return { answer: answer.trim(), retrievedIds, pages, images, ms: Date.now() - started, voiceMeta };
+    return {
+      answer: answer.trim(),
+      retrievedIds,
+      pages,
+      images,
+      ms: Date.now() - started,
+      voiceMeta,
+      ...(mathLesson ? { mathLesson } : {}),
+      ...(scienceExperiment ? { scienceExperiment } : {}),
+      ...(panelCleanAnswer ? { panelCleanAnswer } : {}),
+    };
   }
 
   /**
@@ -225,6 +280,7 @@ export class RagClient {
     body: unknown,
     signal: AbortSignal | undefined,
     onLine: (line: string) => void,
+    idleTimeoutMs: number = config.ragIdleTimeoutMs,
   ): Promise<void> {
     const ctl = new AbortController();
     const onAbort = () => ctl.abort(signal?.reason);
@@ -233,7 +289,7 @@ export class RagClient {
     let timer = setTimeout(() => ctl.abort(new Error(`${label} timeout`)), config.ragFirstByteTimeoutMs);
     const bump = () => {
       clearTimeout(timer);
-      timer = setTimeout(() => ctl.abort(new Error(`${label} stalled`)), config.ragIdleTimeoutMs);
+      timer = setTimeout(() => ctl.abort(new Error(`${label} stalled`)), idleTimeoutMs);
     };
     try {
       const res = await fetch(`${config.tutorApiUrl}${path}`, {
@@ -319,6 +375,7 @@ export class RagClient {
       body,
       opts.signal,
       onLine,
+      opts.imageIds?.length ? config.ragImageIdleTimeoutMs : config.ragIdleTimeoutMs,
     );
 
     if (handlers.onSentence) {
