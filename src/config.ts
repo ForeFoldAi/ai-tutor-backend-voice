@@ -56,6 +56,8 @@ export const config = {
   /** FastAPI RAG: max wait for the response to start (headers), and for each stream chunk after. */
   ragFirstByteTimeoutMs: envInt("RAG_FIRST_BYTE_TIMEOUT_MS", 20000),
   ragIdleTimeoutMs: envInt("RAG_IDLE_TIMEOUT_MS", 20000),
+  /** Image vision turns: allow longer gaps between NDJSON status heartbeats. */
+  ragImageIdleTimeoutMs: envInt("RAG_IMAGE_IDLE_TIMEOUT_MS", 60000),
   stunUrl: env("STUN_URL", "stun:stun.l.google.com:19302"),
   turnUrl: env("TURN_URL"),
   turnUsername: env("TURN_USERNAME"),

@@ -139,6 +139,80 @@ describe("RagClient askStream", () => {
     assert.equal(result.images.length, 2);
     assert.equal(result.images[1].figure_number, "2.12");
   });
+
+  it("forwards math_lesson panels and replaces the answer with clean_answer", async () => {
+    const lesson = {
+      conceptName: "Linear equations",
+      classLevel: "CLASS_8",
+      learningObjective: "Solve for x",
+      visualization: { visualizationType: "algebra_stepper", sliders: [] },
+    };
+    const clean = "A linear equation is like a balance scale.";
+    global.fetch = async () =>
+      ndjsonResponse([
+        { type: "token", content: "A linear equation is like a balance scale. ```math-lesson\n{}" },
+        {
+          type: "math_lesson",
+          lesson,
+          clean_answer: clean,
+        },
+        { type: "done" },
+      ]);
+
+    const client = new RagClient();
+    const panels: Record<string, unknown>[] = [];
+    const replacements: string[] = [];
+    const result = await client.askStream(ASK_OPTS, {
+      onMathLesson: (l, c) => {
+        panels.push(l);
+        replacements.push(c);
+      },
+      onReplace: (c) => replacements.push(`replace:${c}`),
+    });
+
+    assert.equal(panels.length, 1);
+    assert.equal(panels[0].conceptName, "Linear equations");
+    assert.deepEqual(result.mathLesson, lesson);
+    assert.equal(result.answer, clean);
+    assert.equal(result.panelCleanAnswer, clean);
+    assert.ok(replacements.includes(clean));
+    assert.ok(replacements.includes(`replace:${clean}`));
+  });
+
+  it("forwards science_experiment panels with clean_answer", async () => {
+    const experiment = {
+      conceptName: "Photosynthesis",
+      subject: "Science",
+      kind: "lab",
+      experiment: { experimentType: "process", threeViews: [], sliders: [] },
+    };
+    const clean = "Plants make food using sunlight.";
+    global.fetch = async () =>
+      ndjsonResponse([
+        { type: "token", content: "Plants make food using sunlight." },
+        {
+          type: "science_experiment",
+          experiment,
+          clean_answer: clean,
+        },
+        { type: "done" },
+      ]);
+
+    const client = new RagClient();
+    let seen: Record<string, unknown> | undefined;
+    let cleanSeen = "";
+    const result = await client.askStream(ASK_OPTS, {
+      onScienceExperiment: (exp, c) => {
+        seen = exp;
+        cleanSeen = c;
+      },
+    });
+
+    assert.equal(seen?.conceptName, "Photosynthesis");
+    assert.deepEqual(result.scienceExperiment, experiment);
+    assert.equal(result.answer, clean);
+    assert.equal(cleanSeen, clean);
+  });
 });
 
 describe("RagClient timeouts", () => {

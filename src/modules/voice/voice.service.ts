@@ -5,6 +5,7 @@ import { voiceLog } from "../../common/logger";
 import { floatToInt16, int16ToFloat, packPcm, PCM_SAMPLE_RATE, resample, unpackPcm } from "../../audio/pcm";
 import { SileroVad, loadSilero } from "../../audio/vad";
 import { CHUNK_MIN_CHARS, SentenceStream, speakable } from "../../audio/sentences";
+import { forEachWithPrefetch, type PreparedSpeech } from "../../audio/speech-prefetch";
 import {
   AssistantAgentMode,
   ConversationMemoryService,
@@ -80,6 +81,11 @@ type Live = {
   emit: Emit;
   emitPcm?: EmitPcm;
   speaking: boolean;
+  /**
+   * True while runTurn / runAssistantTurn is in flight (thinking through speak).
+   * Lets barge-in abort a turn that has not begun speaking yet.
+   */
+  turnActive: boolean;
   pcmQ: Promise<void>;
   /** Bumped per turn and on interrupt, so filler callbacks can spot a stale turn. */
   turnId: number;
@@ -119,14 +125,15 @@ type Live = {
 };
 
 /**
- * One streaming reply in progress. TTS is chained rather than parallel so
- * frames reach the client in the order the sentences were written.
+ * One streaming reply in progress. Synthesis may overlap (N+1 starts while N
+ * is still synthesizing/emitting); emit stays chained so frames stay ordered.
  */
 type SpeechStream = {
   /** Bumped synchronously on dispatch; `begun` only flips inside the chain. */
   dispatched: number;
   begun: boolean;
   failed: boolean;
+  /** Ordered emit chain — never parallelize PCM / transcript. */
   queue: Promise<void>;
   /**
    * The turn's own signal. interruptSession installs a fresh controller on
@@ -269,6 +276,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       emit,
       emitPcm,
       speaking: false,
+      turnActive: false,
       pcmQ: Promise.resolve(),
       turnId: 0,
       fillerTimer: null,
@@ -374,13 +382,16 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         live.abort.abort();
         live.abort = new AbortController();
         live.turnId += 1;
+        live.turnActive = false;
         this.clearFiller(live);
         voiceLog("utterance_merged", { sessionId: live.sessionId });
       }
       live.emit("student_started_speaking");
       // Filler audio is interruptible AI audio like any other — it does not set
-      // `speaking`, so barge-in has to check it explicitly.
-      if (live.speaking || this.fillerAudible(live)) {
+      // `speaking`, so barge-in has to check it explicitly. A turn that is still
+      // thinking (LLM/RAG, no audio yet) must also abort so the new utterance is
+      // not stuck behind turnQ waiting for the old answer to finish.
+      if (live.speaking || this.fillerAudible(live) || live.turnActive) {
         if (pcmSpeechRms(samples) < config.sttMinSpeechRms) return;
         void this.interruptSession(live.sessionId);
       }
@@ -421,6 +432,11 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     text: string,
     opts: { filler?: boolean; synthetic?: boolean; imageIds?: string[] } = {},
   ): Promise<void> {
+    const live = this.live.get(sessionId);
+    // Typed replacement must cut the in-flight answer, not sit behind turnQ.
+    if (live && (live.turnActive || live.speaking || this.fillerAudible(live))) {
+      await this.interruptSession(sessionId);
+    }
     await this.enqueueTurn(sessionId, () => this.runTurn(sessionId, text, Date.now(), opts));
   }
 
@@ -438,6 +454,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     const live = this.live.get(sessionId);
     live?.abort.abort();
     if (live) {
+      const wasAudible = live.speaking || this.fillerAudible(live);
       if (this.fillerAudible(live)) {
         voiceLog("filler_interrupted", { sessionId });
       }
@@ -446,14 +463,19 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       live.turnId += 1;
       live.abort = new AbortController();
       live.speaking = false;
-      // Reset before any await: the client sends the barge-in words right after
-      // this message, and clearing later would throw them away.
-      live.chunks = [];
-      live.preroll = [];
-      live.pendingPcm = null;
-      live.merged = false;
-      live.vad.reset();
-      live.lastSpokeAt = Date.now();
+      live.turnActive = false;
+      if (wasAudible) {
+        // Client barge-in resends held PCM after this message — drop the old
+        // capture and arm the echo window so speaker leak is not STT'd.
+        live.chunks = [];
+        live.preroll = [];
+        live.pendingPcm = null;
+        live.merged = false;
+        live.vad.reset();
+        live.lastSpokeAt = Date.now();
+      }
+      // Thinking-only cancel: keep the utterance that triggered the abort so
+      // endUtterance can enqueue the replacement turn.
     }
     const session = await this.memory.get(sessionId);
     if (session) {
@@ -574,6 +596,8 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       await this.runAssistantTurn(sessionId, utterance, t0, opts);
       return;
     }
+
+    if (live) live.turnActive = true;
 
     const history = session.recentMessages;
     const chapterName = session.scope.chapterNames[0] || session.scope.chapter || "";
@@ -927,7 +951,10 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     } finally {
       // A turn that ends without ever emitting audio (TTS threw) would
       // otherwise leave the timer armed to speak over the next one.
-      if (live) this.clearFiller(live);
+      if (live) {
+        live.turnActive = false;
+        this.clearFiller(live);
+      }
     }
   }
 
@@ -952,6 +979,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     const signal = live?.abort.signal;
     let turnId = 0;
     if (live) {
+      live.turnActive = true;
       turnId = ++live.turnId;
       live.answerAudioStarted = false;
       live.turnStartedAt = t0;
@@ -1045,7 +1073,10 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       live?.emit("voice_error", { message: MSG.llmFail, recoverable: true });
       await this.speak(sessionId, MSG.llmFail);
     } finally {
-      if (live) this.clearFiller(live);
+      if (live) {
+        live.turnActive = false;
+        this.clearFiller(live);
+      }
     }
   }
 
@@ -1319,6 +1350,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
         const images = freshImages(l, result.images, asksForFigure(query));
         if (images.length) l.emit("related_images", { images, turnId: speech.turnId });
       }
+      this.emitInteractivePanels(l, speech, signal, result);
       return result;
     }
 
@@ -1356,6 +1388,12 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
           rememberFigures(session, images);
           const fresh = freshImages(live, images, asksForFigure(query));
           if (fresh.length) live.emit("related_images", { images: fresh, turnId: speech.turnId });
+        },
+        onMathLesson: (lesson, cleanAnswer) => {
+          this.emitMathLesson(live, speech, signal, lesson, cleanAnswer);
+        },
+        onScienceExperiment: (experiment, cleanAnswer) => {
+          this.emitScienceExperiment(live, speech, signal, experiment, cleanAnswer);
         },
       });
       if (committed && spoken === 0 && !opts.guardNotFound && result.answer) {
@@ -1402,6 +1440,56 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     live?.emit("token_expired", { message: MSG.authExpired });
   }
 
+  /** Same barge-in rule as figures: keep panels on a heard answer; drop if the turn never started. */
+  private panelTurnOk(live: Live | undefined, speech: SpeechStream, signal?: AbortSignal): boolean {
+    if (!live) return false;
+    if (speech.dispatched === 0 && !turnStillActive(signal, speech.turnId, live.turnId)) return false;
+    return true;
+  }
+
+  private emitMathLesson(
+    live: Live | undefined,
+    speech: SpeechStream,
+    signal: AbortSignal | undefined,
+    lesson: Record<string, unknown>,
+    cleanAnswer: string,
+  ): void {
+    if (!this.panelTurnOk(live, speech, signal) || !lesson) return;
+    live!.emit("math_lesson", {
+      lesson,
+      clean_answer: cleanAnswer || "",
+      turnId: speech.turnId,
+    });
+  }
+
+  private emitScienceExperiment(
+    live: Live | undefined,
+    speech: SpeechStream,
+    signal: AbortSignal | undefined,
+    experiment: Record<string, unknown>,
+    cleanAnswer: string,
+  ): void {
+    if (!this.panelTurnOk(live, speech, signal) || !experiment) return;
+    live!.emit("science_experiment", {
+      experiment,
+      clean_answer: cleanAnswer || "",
+      turnId: speech.turnId,
+    });
+  }
+
+  private emitInteractivePanels(
+    live: Live | undefined,
+    speech: SpeechStream,
+    signal: AbortSignal | undefined,
+    result: RagResult,
+  ): void {
+    const clean = result.panelCleanAnswer || result.answer || "";
+    if (result.mathLesson) this.emitMathLesson(live, speech, signal, result.mathLesson, clean);
+    if (result.scienceExperiment) {
+      this.emitScienceExperiment(live, speech, signal, result.scienceExperiment, clean);
+    }
+  }
+
   private async safeRag(ask: Parameters<RagClient["ask"]>[0], live?: Live): Promise<RagResult> {
     try {
       return await this.rag.ask(ask);
@@ -1417,7 +1505,10 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     }
   }
 
-  /** Queue one chunk behind whatever is already synthesizing. Never throws. */
+  /**
+   * Start Edge TTS as soon as a sentence is known. Emit stays on speech.queue so
+   * PCM order matches the text; synthesis of N+1 overlaps emit of N.
+   */
   private streamSay(
     live: Live | undefined,
     session: VoiceSession,
@@ -1426,15 +1517,19 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
   ): void {
     if (!this.streaming(live) || !chunk.trim()) return;
     speech.dispatched += 1;
+    const synthP = this.prepareSpeech(chunk, session, live);
     speech.queue = speech.queue
       .then(async () => {
         if (speech.failed || !turnStillActive(speech.signal, speech.turnId, live?.turnId)) return;
-        await this.speakChunk(live, session, chunk, speech.signal, speech.turnId, speech);
+        const prepared = await synthP;
+        if (!prepared || !live) return;
+        if (!turnStillActive(speech.signal, speech.turnId, live.turnId)) return;
+        await this.emitPreparedChunk(live, session, prepared, speech.signal, speech.turnId, speech);
       })
       .catch((err) => {
         speech.failed = true;
         this.log.warn(`tts stream ${err}`);
-        live.emit("voice_error", { message: MSG.ttsFail, recoverable: true });
+        live?.emit("voice_error", { message: MSG.ttsFail, recoverable: true });
       });
   }
 
@@ -1477,32 +1572,39 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     live.emit("ai_started_speaking");
   }
 
-  /** Returns false when the turn was cut short and the rest should be dropped. */
-  private async speakChunk(
+  /** Kick off Edge TTS; returns null when the chunk has nothing speakable. */
+  private prepareSpeech(
+    chunk: string,
+    session: VoiceSession,
+    live?: Live,
+  ): Promise<PreparedSpeech | null> {
+    const say = speakable(chunk);
+    if (!say) return Promise.resolve(null);
+    return this.tts.synthesize(say, session.accessToken).then(
+      ({ pcm, sampleRate }) => ({ say, pcm, sampleRate }),
+      (err) => {
+        if (/http 401|http 403/.test(String(err))) {
+          this.emitAuthExpired(live);
+        }
+        throw err;
+      },
+    );
+  }
+
+  /**
+   * Emit already-synthesized PCM. Returns false when the turn was cut and the
+   * rest of the reply should be dropped.
+   */
+  private async emitPreparedChunk(
     live: Live,
     session: VoiceSession,
-    chunk: string,
+    prepared: PreparedSpeech,
     signal?: AbortSignal,
     turnId = 0,
     speech?: SpeechStream,
   ): Promise<boolean> {
     const cancelled = (): boolean =>
       !turnStillActive(signal, turnId, live.turnId) || live.abort.signal.aborted;
-    if (cancelled()) return false;
-    const say = speakable(chunk);
-    if (!say) return true;
-    let pcm: Float32Array;
-    let sampleRate: number;
-    try {
-      ({ pcm, sampleRate } = await this.tts.synthesize(say, session.accessToken));
-    } catch (err) {
-      if (/http 401|http 403/.test(String(err))) {
-        this.emitAuthExpired(live);
-      }
-      throw err;
-    }
-    // Synthesis is a network round trip with Edge TTS — the student may well
-    // have barged in while it was out.
     if (cancelled()) return false;
     // "Speaking" starts with real audio in hand, so the UI never shows speaking over silence
     // (and never blocks the mic) while Edge is still synthesizing or retrying.
@@ -1511,7 +1613,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       await this.beginSpeech(live, session, turnId);
       if (cancelled()) return false;
     }
-    const at16 = resample(pcm, sampleRate, PCM_SAMPLE_RATE);
+    const at16 = resample(prepared.pcm, prepared.sampleRate, PCM_SAMPLE_RATE);
     const packed = packPcm(floatToInt16(at16), PCM_SAMPLE_RATE, false);
     // "Answer ready" is the first frame on the wire, not the reply string:
     // with Edge TTS every chunk is another network round trip, so the student
@@ -1531,7 +1633,9 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
     live.emitPcm?.(packed);
     // Mirror spoken text with the audio so the transcript keeps pace.
     if (turnId > 0 && speech && !speech.transcriptFinal) {
-      speech.spokenText = speech.spokenText ? `${speech.spokenText} ${say}` : say;
+      speech.spokenText = speech.spokenText
+        ? `${speech.spokenText} ${prepared.say}`
+        : prepared.say;
       live.emit(
         "transcript",
         assistantTranscript(turnId, speech.spokenText, speech.transcriptAction),
@@ -1581,10 +1685,17 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       live.emit("transcript", assistantTranscript(turnId, text, opts.action));
     }
     const t0 = Date.now();
+    const chunks = splitSentences(text);
     try {
-      for (const chunk of splitSentences(text)) {
-        if (!(await this.speakChunk(live, session, chunk, opts.signal, turnId, speech))) break;
-      }
+      await forEachWithPrefetch(
+        chunks,
+        (chunk) => this.prepareSpeech(chunk, session, live),
+        async (prepared) => {
+          if (!prepared) return true;
+          if (!turnStillActive(opts.signal, turnId, live.turnId)) return false;
+          return this.emitPreparedChunk(live, session, prepared, opts.signal, turnId, speech);
+        },
+      );
       voiceLog("tts", { sessionId, ttsMs: Date.now() - t0 });
     } catch (err) {
       this.log.warn(`tts ${err}`);
