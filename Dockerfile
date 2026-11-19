@@ -1,7 +1,9 @@
 # Production image for Nest voice RTC (Silero VAD via onnxruntime needs glibc; STT is FastAPI, TTS is Edge).
 FROM node:22-bookworm-slim AS build
 WORKDIR /app
-COPY package.json package-lock.json* ./
+# Skip onnxruntime-node CUDA EP download (release asset 404s; VAD uses CPU ORT).
+ENV ONNXRUNTIME_NODE_INSTALL_CUDA=skip
+COPY package.json package-lock.json* .npmrc ./
 RUN npm ci
 COPY . .
 RUN npm run build
@@ -9,10 +11,11 @@ RUN npm run build
 FROM node:22-bookworm-slim
 WORKDIR /app
 ENV NODE_ENV=production
+ENV ONNXRUNTIME_NODE_INSTALL_CUDA=skip
 # Coolify's healthcheck shells out to curl/wget; slim images ship neither.
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
   && rm -rf /var/lib/apt/lists/*
-COPY package.json package-lock.json* ./
+COPY package.json package-lock.json* .npmrc ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
 # Bake Silero VAD into the image so a cold start never waits on Hugging Face.

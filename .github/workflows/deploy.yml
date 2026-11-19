@@ -8,6 +8,8 @@ on:
 
 env:
   IMAGE: ghcr.io/forefoldai/ai-tutor-backend-voice
+  # Also set in .npmrc; keep env so cached installs still skip the broken CUDA EP download.
+  ONNXRUNTIME_NODE_INSTALL_CUDA: skip
 
 jobs:
   test:
