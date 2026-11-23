@@ -12,6 +12,7 @@ import {
   isPersonalIntro,
   dialogueActForUtterance,
   pendingQuestion,
+  isNonAnswer,
 } from "./reply-intent";
 
 describe("pendingQuestion", () => {
@@ -87,6 +88,18 @@ describe("classifyReplyIntent", () => {
   it("never grades a reaction as a wrong quiz answer", () => {
     for (const ack of ["(laughing)", "haha", "wow", "interesting", "cool"]) {
       assert.equal(classifyReplyIntent(ack, true), "UNCLEAR", `graded a reaction: ${ack}`);
+    }
+  });
+
+  it("never grades spoiler complaints as quiz answers", () => {
+    for (const ask of [
+      "I don't, I'm not told to reveal the answer",
+      "Don't reveal the answer",
+      "You shouldn't tell me the answer",
+      "Let me try",
+    ]) {
+      assert.equal(isNonAnswer(ask), true, ask);
+      assert.equal(classifyReplyIntent(ask, true), "NEW_QUESTION", ask);
     }
   });
 });
