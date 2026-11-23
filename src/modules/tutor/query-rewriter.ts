@@ -4,7 +4,8 @@ const FOLLOWUP = /^(why|how|what about|and|who)\b/i;
 const DEIXIS = /\b(it|they|them|this|that|those|these)\b/i;
 const SIMPLIFY = /\b(simpler|simply|easier|too hard|don'?t understand|explain that)\b/i;
 const EXAMPLE = /\b(example|for instance)\b/i;
-const ASK_ME = /\b(ask me|quiz|test me|take a test|give me a test)\b/i;
+const ASK_ME =
+  /\b(?:ask me|quiz(?:\s+me)?|test me|take a test|give me a test|tricky questions?|(?:frame|make|create|give|set|ask)\s+(?:me\s+)?(?:some|a few|\d+)?\s*(?:simple|easy|tricky|tough|hard|quick|short\s+)*(?:questions?|puzzles?|riddles?)|(?:frame|make|create)\s+some)\b/i;
 
 export function lastUserQuestion(history: ChatTurn[]): string {
   for (let i = history.length - 1; i >= 0; i--) {
@@ -95,9 +96,10 @@ export function groundChapterQuery(current: string, chapterName: string): string
 
 const COUNT_WORDS: Record<string, number> = {
   one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
-  a: 1, an: 1, single: 1, couple: 2, few: 3,
+  a: 1, an: 1, single: 1, couple: 2, few: 3, some: 2,
 };
-const QUIZ_COUNT = /\b(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|a|an|single|couple|few)\s+(?:of\s+)?(?:(?:quick|short|simple|small|more|mcq|multiple[\s-]choice)\s+)*(?:questions?|qs|mcqs?)\b/i;
+const QUIZ_COUNT =
+  /\b(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|a|an|single|couple|few|some)\s+(?:of\s+)?(?:(?:quick|short|simple|small|more|tricky|tough|hard|mcq|multiple[\s-]choice)\s+)*(?:questions?|qs|mcqs?|puzzles?|riddles?)\b/i;
 
 /** How many questions the student asked for ("ask me 5 questions"), clamped to 1-10; null when unstated. */
 export function quizCount(q: string): number | null {

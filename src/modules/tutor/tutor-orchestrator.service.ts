@@ -52,7 +52,14 @@ export function decideAction(opts: {
     if (!isRecallQuestion(opts.utterance) && looksLikeAnswer(opts.utterance)) return "EVALUATE";
     if (looksLikeNewQuestion(opts.utterance)) return "EXPLAIN";
     if (REFUSAL_OR_PIVOT.test(opts.utterance.trim())) return "ANSWER";
-    if (intent === "WRONG_ANSWER") return "EVALUATE";
+    // Grade only real attempts. A clear statement that isn't answer-shaped
+    // ("A million is one million") must not be forced through quiz grading /
+    // "I think you meant…" just because a check question is open.
+    if (intent === "WRONG_ANSWER") {
+      const words = opts.utterance.trim().split(/\s+/).filter(Boolean).length;
+      if (words <= 4) return "EVALUATE";
+      return "ANSWER";
+    }
     if (intent === "UNCLEAR") return "REQUEST_CLARIFICATION";
     return "EVALUATE";
   }

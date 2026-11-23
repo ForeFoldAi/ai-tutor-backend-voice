@@ -35,6 +35,11 @@ describe("query rewrite", () => {
     assert.equal(followupIntent("Can you explain that more simply?"), "simplify");
     assert.equal(followupIntent("Give me an example."), "example");
     assert.equal(followupIntent("Ask me a question."), "quiz");
+    assert.equal(
+      followupIntent("Okay, my friend wants some simple tricky questions. Can you frame some on this chapter?"),
+      "quiz",
+    );
+    assert.equal(followupIntent("Can you frame some simple tricky questions?"), "quiz");
   });
 
   it("rewrites who-started-it against the prior topic", () => {
@@ -187,6 +192,32 @@ describe("orchestrator", () => {
     assert.equal(
       decideAction({ utterance: "Please conduct a quiz", awaitingAnswer: false, turnsSinceCheck: 0 }),
       "START_QUIZ",
+    );
+    assert.equal(
+      decideAction({
+        utterance: "Okay, my friend wants some simple tricky questions. Can you frame some on this chapter?",
+        awaitingAnswer: false,
+        turnsSinceCheck: 0,
+      }),
+      "START_QUIZ",
+    );
+  });
+  it("does not grade a general statement as a quiz answer", () => {
+    assert.equal(
+      decideAction({ utterance: "A million is one million", awaitingAnswer: true, turnsSinceCheck: 1 }),
+      "ANSWER",
+    );
+    assert.equal(
+      decideAction({ utterance: "What is the number?", awaitingAnswer: true, turnsSinceCheck: 1 }),
+      "EXPLAIN",
+    );
+    assert.equal(
+      decideAction({
+        utterance: "I don't, I'm not told to reveal the answer",
+        awaitingAnswer: true,
+        turnsSinceCheck: 1,
+      }),
+      "EXPLAIN",
     );
   });
   it("treats goodbye as answer not evaluate", () => {
