@@ -4,6 +4,7 @@ import { MSG } from "../../common/messages";
 import { voiceLog } from "../../common/logger";
 import { floatToInt16, int16ToFloat, packPcm, PCM_SAMPLE_RATE, resample, unpackPcm } from "../../audio/pcm";
 import { SileroVad, loadSilero } from "../../audio/vad";
+import { createPcmIngest, finishPcm, invalidatePcm, offerPcm, takeLatest, type PcmIngest } from "./pcm-ingest";
 import { CHUNK_MIN_CHARS, SentenceStream, speakable } from "../../audio/sentences";
 import { forEachWithPrefetch, type PreparedSpeech } from "../../audio/speech-prefetch";
 import {
@@ -86,7 +87,8 @@ type Live = {
    * Lets barge-in abort a turn that has not begun speaking yet.
    */
   turnActive: boolean;
-  pcmQ: Promise<void>;
+  /** One Silero inference at a time; older mic frames are dropped, not queued. */
+  pcm: PcmIngest;
   /** Bumped per turn and on interrupt, so filler callbacks can spot a stale turn. */
   turnId: number;
   /** Arm timer, then reused as the drain timer once the filler is playing. */
@@ -111,7 +113,7 @@ type Live = {
   lastFillerPhrase: string;
   /** Student utterance for the in-flight turn — committed when speech starts. */
   turnUtterance: string;
-  /** Queue one turn at a time per session (pcmQ already serializes VAD; this covers text + STT). */
+  /** Queue one turn at a time per session (mic ingest is separate; this covers text + STT). */
   turnQ: Promise<void>;
   /** Epoch ms the tutor last finished speaking (echo window). */
   lastSpokeAt: number;
@@ -277,7 +279,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       emitPcm,
       speaking: false,
       turnActive: false,
-      pcmQ: Promise.resolve(),
+      pcm: createPcmIngest(),
       turnId: 0,
       fillerTimer: null,
       fillerPending: null,
@@ -343,17 +345,41 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
   onPcm(sessionId: string, buf: Buffer): void {
     const live = this.live.get(sessionId);
     if (!live || buf.length < 10) return;
-    live.pcmQ = live.pcmQ.then(() => this.consumePcm(live, buf)).catch((err) => {
-      this.log.warn(`vad ${err}`);
-    });
+    if (!offerPcm(live.pcm, buf)) return;
+    void this.drainPcm(live, buf);
   }
 
-  private async consumePcm(live: Live, buf: Buffer): Promise<void> {
+  /** Infer the frame we have, then the newest one that arrived while we were busy. */
+  private async drainPcm(live: Live, first: Buffer): Promise<void> {
+    let frame: Buffer | null = first;
+    try {
+      while (frame) {
+        const epoch = live.pcm.epoch;
+        try {
+          await this.consumePcm(live, frame, epoch);
+        } catch (err) {
+          this.log.warn(`vad ${err}`);
+        }
+        frame = takeLatest(live.pcm);
+      }
+    } finally {
+      const pending = finishPcm(live.pcm);
+      if (pending && offerPcm(live.pcm, pending)) void this.drainPcm(live, pending);
+    }
+  }
+
+  private async consumePcm(live: Live, buf: Buffer, epoch: number): Promise<void> {
     let { samples, sampleRate } = unpackPcm(buf);
     if (sampleRate !== PCM_SAMPLE_RATE) {
       samples = floatToInt16(resample(int16ToFloat(samples), sampleRate, PCM_SAMPLE_RATE));
     }
     const events = await live.vad.push(samples);
+    // An interrupt landed while this frame was inferring. The client resends
+    // the words that cut in — don't let this stale frame reopen the old turn.
+    if (epoch !== live.pcm.epoch) {
+      live.vad.reset();
+      return;
+    }
     const hadStart = events.includes("start");
     const hadStop = events.includes("stop");
     // Turn ended and a new one began inside this frame: close the old one first,
@@ -467,6 +493,7 @@ export class VoiceService implements IVoiceProvider, OnModuleInit {
       if (wasAudible) {
         // Client barge-in resends held PCM after this message — drop the old
         // capture and arm the echo window so speaker leak is not STT'd.
+        invalidatePcm(live.pcm);
         live.chunks = [];
         live.preroll = [];
         live.pendingPcm = null;

@@ -187,8 +187,20 @@ export class ProgressService implements OnModuleInit {
     return rows;
   }
 
-  async conversationMessages(conversationId: string) {
+  /** With studentId, only that student's conversation is returned (empty otherwise). */
+  async conversationMessages(conversationId: string, studentId?: string) {
     if (!this.pool) return [];
+    if (studentId !== undefined) {
+      const { rows } = await this.pool.query(
+        `SELECT m.role, m.content, m.created_at FROM rtc_conversation_messages m
+         WHERE m.conversation_id=$1
+           AND EXISTS (SELECT 1 FROM rtc_voice_sessions s
+                       WHERE s.conversation_id=m.conversation_id AND s.student_id=$2)
+         ORDER BY m.id ASC LIMIT 200`,
+        [conversationId, studentId],
+      );
+      return rows;
+    }
     const { rows } = await this.pool.query(
       `SELECT role, content, created_at FROM rtc_conversation_messages
        WHERE conversation_id=$1 ORDER BY id ASC LIMIT 200`,

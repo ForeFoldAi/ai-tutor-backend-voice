@@ -6,7 +6,7 @@ import {
 } from "@nestjs/websockets";
 import type { IncomingMessage } from "http";
 import type { WebSocket } from "ws";
-import { verifyAccessToken } from "../../common/jwt";
+import { tokenAcceptedByApi, verifyAccessToken } from "../../common/jwt";
 import { MSG } from "../../common/messages";
 import { iceServers } from "../../config";
 import {
@@ -116,7 +116,9 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
         await this.resumeCall(client, msg);
         return;
       }
-      const sessionId = String(msg.sessionId || client.sessionId || "");
+      // Only the session this socket started or resumed — a client-supplied id
+      // would let one student type into, interrupt or end another's call.
+      const sessionId = client.sessionId || "";
       if (!sessionId) return;
       if (type === "sdp_offer") {
         const answer = await this.rtc.acceptOffer(
@@ -146,7 +148,6 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
         return;
       }
       if (type === "token_update") {
-        const sessionId = String(msg.sessionId || client.sessionId || "");
         const token = String(msg.token || "");
         if (!sessionId || !token || !client.studentId) return;
         const ok = await this.voice.updateAccessToken(sessionId, token, client.studentId);
@@ -191,6 +192,12 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
   private async startCall(client: Client, msg: Record<string, unknown>): Promise<void> {
     const token = String(msg.token || "");
     const user = verifyAccessToken(token);
+    // Signed in on another device since: the client's token_expired handler refreshes, the refresh
+    // is refused, and the student is signed out with the reason. No session is created here.
+    if (!(await tokenAcceptedByApi(token))) {
+      this.send(client, "token_expired", { message: MSG.authExpired });
+      return;
+    }
     const agentMode = normalizeAgentMode(msg.agentMode ?? msg.agent_mode);
     const history = parseConversationHistory(msg.conversationHistory ?? msg.conversation_history);
     const session = await this.voice.create({
@@ -207,6 +214,10 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
       agentMode,
       conversationHistory: history,
     });
+    // A second session_start on the same socket must not leave the first call's live state behind.
+    if (client.sessionId && client.sessionId !== session.id) {
+      await this.voice.detach(client.sessionId, client);
+    }
     client.sessionId = session.id;
     const attached = await this.wireTransport(client, session.id);
     if (attached === "owned_elsewhere") {
@@ -243,6 +254,10 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
   private async resumeCall(client: Client, msg: Record<string, unknown>): Promise<void> {
     const token = String(msg.token || "");
     const user = verifyAccessToken(token);
+    if (!(await tokenAcceptedByApi(token))) {
+      this.send(client, "token_expired", { message: MSG.authExpired });
+      return;
+    }
     const sessionId = String(msg.sessionId || "");
     if (!sessionId) {
       this.send(client, "voice_error", { message: "Missing session id." });
