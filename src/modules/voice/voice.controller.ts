@@ -1,6 +1,19 @@
-import { Body, Controller, Get, Headers, Param, Post, Req, UseGuards } from "@nestjs/common";
+import {
+  Body,
+  Controller,
+  ForbiddenException,
+  Get,
+  Headers,
+  Param,
+  Post,
+  Req,
+  UnauthorizedException,
+  UseGuards,
+} from "@nestjs/common";
 import { SkipThrottle } from "@nestjs/throttler";
 import { JwtAuthGuard } from "../../common/auth.guard";
+import { tokenAcceptedByApi } from "../../common/jwt";
+import { MSG } from "../../common/messages";
 import { config, iceServers } from "../../config";
 import { ConversationService } from "../conversation/conversation.service";
 import { SessionOwnershipService } from "../conversation/session-ownership.service";
@@ -56,6 +69,7 @@ export class VoiceController {
   async start(@Body() body: StartSessionDto, @Req() req: Authed) {
     if (this.voice.isDraining()) throw new Error("server_draining");
     const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+    if (!(await tokenAcceptedByApi(token))) throw new UnauthorizedException(MSG.authExpired);
     const session = await this.voice.create({
       studentId: req.user.studentId,
       token,
@@ -84,16 +98,18 @@ export class VoiceController {
 
   @UseGuards(JwtAuthGuard)
   @Post("rtc/voice/session/:id/end")
-  async end(@Param("id") id: string) {
+  async end(@Param("id") id: string, @Req() req: Authed) {
+    await this.assertOwnsSession(id, req);
     await this.voice.end(id);
     return { ok: true };
   }
 
   @UseGuards(JwtAuthGuard)
   @Get("rtc/conversations/:id")
-  async conversation(@Param("id") id: string) {
+  async conversation(@Param("id") id: string, @Req() req: Authed) {
     const session = await this.conversations.get(id);
     if (session) {
+      if (!this.canRead(session.studentId, req)) throw new ForbiddenException();
       return {
         id: session.conversationId,
         sessionId: session.id,
@@ -102,18 +118,19 @@ export class VoiceController {
         tutor: session.tutor,
       };
     }
-    return { id, messages: await this.progress.conversationMessages(id) };
+    return { id, messages: await this.progress.conversationMessages(id, this.ownerFilter(req)) };
   }
 
   @UseGuards(JwtAuthGuard)
   @Get("rtc/conversations/:id/messages")
-  messages(@Param("id") id: string) {
-    return this.progress.conversationMessages(id);
+  messages(@Param("id") id: string, @Req() req: Authed) {
+    return this.progress.conversationMessages(id, this.ownerFilter(req));
   }
 
   @UseGuards(JwtAuthGuard)
   @Post("rtc/tutor/query")
-  async query(@Body() body: TutorQueryDto) {
+  async query(@Body() body: TutorQueryDto, @Req() req: Authed) {
+    await this.assertOwnsSession(body.sessionId, req);
     await this.voice.handleText(body.sessionId, body.query);
     return { ok: true };
   }
@@ -131,5 +148,21 @@ export class VoiceController {
       return [];
     }
     return this.progress.studentProgress(id);
+  }
+
+  /** Tutors may review any transcript (unchanged); students only their own. */
+  private canRead(ownerId: string, req: Authed): boolean {
+    return ownerId === req.user.studentId || req.user.role === "tutor";
+  }
+
+  private ownerFilter(req: Authed): string | undefined {
+    return req.user.role === "tutor" ? undefined : req.user.studentId;
+  }
+
+  /** A session id alone must not let one student drive or end another student's call. */
+  private async assertOwnsSession(sessionId: string, req: Authed): Promise<void> {
+    const session = await this.conversations.get(String(sessionId || ""));
+    if (!session) return; // unknown / already gone: the handlers already treat this as a no-op
+    if (session.studentId !== req.user.studentId) throw new ForbiddenException();
   }
 }
